@@ -1,0 +1,4 @@
+locations:
+- code_source:
+    module_name: ciq_test_2.definitions
+  location_name: ciq_test_2_definitions

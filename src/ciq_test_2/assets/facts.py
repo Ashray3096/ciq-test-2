@@ -36,7 +36,7 @@ class FactConfig(Config):
     metadata={
         "data_type": "fact",
         "schema": "star",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def fact_products(
@@ -187,7 +187,7 @@ def fact_products(
     metadata={
         "data_type": "fact",
         "schema": "star",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def fact_certificates(
@@ -273,6 +273,9 @@ def fact_certificates(
                 'certificate_type': record.get('cert_certificate_type', ''),
                 'serial_number': record.get('cert_serial_number'),
                 'plant_registry_number': record.get('cert_plant_registry_number', ''),
+
+                # Receipt method (0=hand-delivered, 1=e-filed, 2=mailed, 3=overnight)
+                'receipt_method': record.get('receipt_method'),
 
                 # Dates
                 'application_date': record.get('cert_application_date'),

@@ -38,7 +38,7 @@ class TTBProcessingConfig(Config):
 class TTBCleaningConfig(Config):
     """Configuration for TTB cleaning assets."""
     s3_bucket: str = "ciq-dagster"
-    s3_output_prefix: str = "2-ttb-processed-data"
+    s3_output_prefix: str = "ttb-pre-prod/ttb_processed_data"
     enable_deduplication: bool = True
     data_quality_analysis: bool = True
     create_partitioned_output: bool = True
@@ -47,7 +47,7 @@ class TTBCleaningConfig(Config):
 class TTBStructuringConfig(Config):
     """Configuration for TTB structuring assets."""
     s3_bucket: str = "ciq-dagster"
-    s3_output_prefix: str = "2-ttb-processed-data"
+    s3_output_prefix: str = "ttb-pre-prod/ttb_processed_data"
     create_partitioned_output: bool = True
     validate_schema: bool = True
     data_quality_analysis: bool = True
@@ -362,7 +362,7 @@ def get_field_transformation_rules(data_type: str) -> Dict[str, List[Dict[str, A
     metadata={
         "data_type": "extracted",
         "stage": "processing",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_extracted_data(
@@ -487,7 +487,7 @@ def ttb_extracted_data(
     metadata={
         "data_type": "cleaned",
         "stage": "processing",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_cleaned_data(
@@ -661,7 +661,7 @@ def ttb_cleaned_data(
     metadata={
         "data_type": "structured",
         "stage": "processing",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_structured_data(

@@ -138,6 +138,12 @@ class COLADetailParser(TTBDataExtractor):
             # Extract qualifications (long text field)
             data['qualifications'] = self._extract_qualifications(soup)
 
+            # Additional fields for fact_cola_applications alignment
+            data['filing_date'] = self._extract_text_after_strong(soup, 'Filing Date')
+            data['expiration_date'] = self._extract_text_after_strong(soup, 'Expiration')
+            data['rep_id_no'] = self._extract_text_after_strong(soup, 'Rep')
+            data['additional_information'] = self._extract_additional_info(soup)
+
             data['extraction_errors'] = self.extraction_errors.copy()
 
         except Exception as e:
@@ -260,6 +266,20 @@ class COLADetailParser(TTBDataExtractor):
 
         return None
 
+    def _extract_additional_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract additional information/remarks from COLA detail page."""
+        try:
+            # Look for remarks, notes, additional info sections
+            patterns = ['Additional Information', 'Remarks', 'Notes', 'Comments', 'Additional']
+            for pattern in patterns:
+                info = self._extract_text_after_strong(soup, pattern)
+                if info:
+                    return info
+            return None
+        except Exception as e:
+            self.extraction_errors.append(f"Error extracting additional info: {str(e)}")
+            return None
+
 
 class CertificateParser(TTBDataExtractor):
     """Parser for TTB Certificate HTML pages."""
@@ -304,24 +324,62 @@ class CertificateParser(TTBDataExtractor):
             # Dates
             data['application_date'] = self._extract_field_by_number(soup, '16')  # Field 16
             data['approval_date'] = self._extract_field_by_number(soup, '19')  # Field 19: Date Issued
+            data['filing_date'] = self._extract_field_by_number(soup, '16')  # Same as application_date for certificates
+            data['expiration_date'] = self._extract_field_by_number(soup, '20')  # Field 20 if exists
 
-            # Extract checkbox information
-            data.update(self._extract_checkboxes(soup))
+            # Extract checkbox information (nested for backward compatibility)
+            checkbox_data = self._extract_checkboxes(soup)
+            data.update(checkbox_data)
 
-            # Extract TTB codes
-            data.update(self._extract_ttb_codes(soup))
+            # Also extract as consolidated string columns for fact_cola_applications
+            source = checkbox_data.get('source_of_product', {})
+            if source.get('domestic'):
+                data['source_of_product'] = 'DOMESTIC'
+            elif source.get('imported'):
+                data['source_of_product'] = 'IMPORTED'
+            else:
+                data['source_of_product'] = None
+
+            product = checkbox_data.get('product_type', {})
+            if product.get('wine'):
+                data['type_of_product'] = 'WINE'
+            elif product.get('distilled_spirits'):
+                data['type_of_product'] = 'DISTILLED SPIRITS'
+            elif product.get('malt_beverage'):
+                data['type_of_product'] = 'MALT BEVERAGE'
+            else:
+                data['type_of_product'] = None
+
+            # Extract TTB codes as separate columns
+            ttb_codes = self._extract_ttb_codes_flat(soup)
+            data['ct_code'] = ttb_codes.get('ct_code')
+            data['or_code'] = ttb_codes.get('or_code')
+            # Keep nested structure for backward compatibility
+            data['ttb_codes'] = ttb_codes
 
             # Extract image information
             data['label_images'] = self._extract_image_info(soup)
 
             # Extract company address
-            data.update(self._extract_certificate_company_info(soup))
+            company_info = self._extract_certificate_company_info(soup)
+            data.update(company_info)
 
-            # Extract signatures
-            data.update(self._extract_signatures(soup))
+            # Extract applicant name from company info or contact section
+            data['applicant_name'] = company_info.get('applicant_business_name') or self._extract_field_by_number(soup, '8')
+
+            # Extract signatures as separate columns
+            signatures = self._extract_signatures_flat(soup)
+            data['applicant_signature'] = signatures.get('applicant_signature')
+            data['ttb_authorized_signature'] = signatures.get('authorized_signature_url')
+            # Keep nested structure for backward compatibility
+            data['signatures'] = signatures
 
             # Extract qualifications and status
             data.update(self._extract_certificate_status(soup))
+
+            # Additional fields
+            data['rep_id_no'] = self._extract_field_by_number(soup, '3') or self._extract_field_by_number(soup, '5')
+            data['additional_information'] = self._extract_additional_info(soup)
 
             data['extraction_errors'] = self.extraction_errors.copy()
 
@@ -424,7 +482,12 @@ class CertificateParser(TTBDataExtractor):
         return checkbox_data
 
     def _extract_ttb_codes(self, soup: BeautifulSoup) -> Dict[str, Any]:
-        """Extract CT and OR codes."""
+        """Extract CT and OR codes (legacy - returns nested dict)."""
+        codes = self._extract_ttb_codes_flat(soup)
+        return {'ttb_codes': codes} if codes else {}
+
+    def _extract_ttb_codes_flat(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """Extract CT and OR codes as flat dictionary."""
         codes = {}
         try:
             # Look for CT and OR codes in the header
@@ -446,7 +509,7 @@ class CertificateParser(TTBDataExtractor):
         except Exception as e:
             self.extraction_errors.append(f"Error extracting TTB codes: {str(e)}")
 
-        return {'ttb_codes': codes} if codes else {}
+        return codes
 
     def _extract_image_info(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """Extract label image information and URLs."""
@@ -555,7 +618,12 @@ class CertificateParser(TTBDataExtractor):
         return company_info
 
     def _extract_signatures(self, soup: BeautifulSoup) -> Dict[str, Any]:
-        """Extract signature information."""
+        """Extract signature information (legacy - returns nested dict)."""
+        signatures = self._extract_signatures_flat(soup)
+        return {'signatures': signatures} if signatures else {}
+
+    def _extract_signatures_flat(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """Extract signature information as flat dictionary."""
         signatures = {}
 
         try:
@@ -584,7 +652,29 @@ class CertificateParser(TTBDataExtractor):
         except Exception as e:
             self.extraction_errors.append(f"Error extracting signatures: {str(e)}")
 
-        return {'signatures': signatures} if signatures else {}
+        return signatures
+
+    def _extract_additional_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract additional information/remarks from certificate."""
+        try:
+            # Look for remarks, notes, additional info sections
+            patterns = ['Additional Information', 'Remarks', 'Notes', 'Comments', 'Additional']
+            for pattern in patterns:
+                # Try using the base class method
+                info = self._extract_text_after_strong(soup, pattern)
+                if info:
+                    return info
+
+            # Also try field-based extraction
+            for field_num in ['21', '22', '23']:  # Try various field numbers that might have additional info
+                info = self._extract_field_by_number(soup, field_num)
+                if info and len(info) > 10:  # Only if it has meaningful content
+                    return info
+
+            return None
+        except Exception as e:
+            self.extraction_errors.append(f"Error extracting additional info: {str(e)}")
+            return None
 
     def _extract_certificate_status(self, soup: BeautifulSoup) -> Dict[str, Any]:
         """Extract status and qualifications from certificate."""

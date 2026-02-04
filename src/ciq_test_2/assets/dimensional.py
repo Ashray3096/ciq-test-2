@@ -35,7 +35,7 @@ class DimensionalConfig(Config):
     metadata={
         "data_type": "dimension",
         "schema": "star",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def dim_dates(
@@ -117,7 +117,7 @@ def dim_dates(
     metadata={
         "data_type": "dimension",
         "schema": "star",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def dim_companies(
@@ -214,7 +214,7 @@ def dim_companies(
     metadata={
         "data_type": "dimension",
         "schema": "star",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def dim_products(

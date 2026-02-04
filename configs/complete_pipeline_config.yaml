@@ -4,7 +4,7 @@ ops:
       max_sequence_per_batch: 99999
       consecutive_failure_threshold: 10
       s3_bucket: "ciq-dagster"
-      raw_data_prefix: "1-ttb-raw-data"
+      raw_data_prefix: "ttb-pre-prod/ttb_raw_data"
       ssl_verify: false
       max_retries: 3
       request_delay_seconds: 0.5
@@ -12,14 +12,14 @@ ops:
   ttb_raw_extraction:
     config:
       s3_bucket: "ciq-dagster"
-      s3_input_prefix: "1-ttb-raw-data"
+      s3_input_prefix: "ttb-pre-prod/ttb_raw_data"
       enable_parsing_validation: true
       data_quality_analysis: true
 
   ttb_cleaned_data:
     config:
       s3_bucket: "ciq-dagster"
-      s3_output_prefix: "2-ttb-processed-data"
+      s3_output_prefix: "ttb-pre-prod/ttb_processed_data"
       enable_deduplication: true
       data_quality_analysis: true
       create_partitioned_output: true
@@ -27,7 +27,7 @@ ops:
   ttb_structured_output:
     config:
       s3_bucket: "ciq-dagster"
-      s3_output_prefix: "2-ttb-processed-data"
+      s3_output_prefix: "ttb-pre-prod/ttb_processed_data"
       create_partitioned_output: true
       validate_schema: true
       data_quality_analysis: true
@@ -35,7 +35,7 @@ ops:
   ttb_consolidated_data:
     config:
       bucket_name: "ciq-dagster"
-      s3_output_prefix: "3-ttb-consolidated"
+      s3_output_prefix: "ttb-pre-prod/ttb_consolidated"
       create_partitioned_output: true
       data_quality_analysis: true
       deduplication_enabled: true

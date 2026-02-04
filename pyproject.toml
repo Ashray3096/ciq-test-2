@@ -1,15 +1,17 @@
 [project]
 name = "ciq_test_2"
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.9,<3.15"
 version = "0.1.0"
 dependencies = [
-    "dagster==1.11.10",
-    "localstack>=4.8.1",
-    "dagster-aws>=0.24.10",
+    "dagster>=1.12.11",
+    "dagster-webserver>=1.12.11",
+    "dagster-aws>=0.28.11",
     "requests>=2.31.0",
     "beautifulsoup4>=4.13.5",
     "supabase>=2.19.0",
     "psycopg2-binary>=2.9.10",
+    "pandas>=3.0.0",
+    "pyarrow>=23.0.0",
 ]
 
 [build-system]

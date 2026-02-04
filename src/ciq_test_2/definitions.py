@@ -4,7 +4,8 @@ TTB Pipeline Definitions
 Modern Dagster definitions following best practices with proper asset organization,
 resource management, and configuration.
 """
-from dagster import Definitions, load_assets_from_modules, load_asset_checks_from_modules, EnvVar
+import os
+from dagster import Definitions, load_assets_from_modules, load_asset_checks_from_modules, EnvVar, FilesystemIOManager
 from dagster_aws.s3 import S3PickleIOManager
 
 # Import organized asset modules
@@ -37,6 +38,24 @@ def get_environment() -> str:
 
 def get_resources_for_environment(environment: str) -> dict:
     """Get resources configured for the specified environment."""
+    # Check if valid AWS credentials are available
+    aws_access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    has_valid_aws = aws_access_key and not aws_access_key.startswith("your-")
+
+    # Use local filesystem for development without valid AWS credentials
+    if environment == "development" and not has_valid_aws:
+        io_manager = FilesystemIOManager(
+            base_dir="./dagster_storage"  # Local storage directory
+        )
+    else:
+        # Use S3 for production or when valid AWS credentials exist
+        # All pipeline data stored under s3://ciq-dagster/ttb-pre-prod/
+        io_manager = S3PickleIOManager(
+            s3_bucket=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
+            s3_prefix="ttb-pre-prod",  # All assets stored under this prefix
+            s3_resource=get_s3_resource()
+        )
+
     base_resources = {
         # Standard S3 resource
         "s3_resource": get_s3_resource(),
@@ -47,12 +66,8 @@ def get_resources_for_environment(environment: str) -> dict:
             region_name=EnvVar("AWS_REGION").get_value("us-east-1")
         ),
 
-        # IO Managers - Use built-in S3PickleIOManager with clean TTB structure
-        "io_manager": S3PickleIOManager(
-            s3_bucket=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
-            s3_prefix="",  # Let Dagster handle the path structure
-            s3_resource=get_s3_resource()
-        ),
+        # IO Manager - local filesystem for dev, S3 for production
+        "io_manager": io_manager,
 
         # Supabase resources
         "supabase_resource": SupabaseResource(),
@@ -60,14 +75,6 @@ def get_resources_for_environment(environment: str) -> dict:
             supabase_resource=SupabaseResource()
         )
     }
-
-    # Add environment-specific resource configurations
-    if environment == "production":
-        # Production-specific resources (monitoring, alerting, etc.)
-        pass
-    elif environment == "development":
-        # Development-specific resources (local overrides, etc.)
-        pass
 
     return base_resources
 

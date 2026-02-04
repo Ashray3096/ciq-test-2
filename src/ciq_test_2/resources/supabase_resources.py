@@ -54,6 +54,7 @@ class SupabaseIOManager(ConfigurableIOManager):
     """IO Manager for writing TTB data to Supabase tables."""
 
     supabase_resource: SupabaseResource
+    schema_name: str = "ttb-pre-prod"  # Default schema for TTB tables
 
     def handle_output(self, context: OutputContext, obj: Dict[str, Any]):
         """Write TTB data to appropriate Supabase table."""
@@ -92,43 +93,58 @@ class SupabaseIOManager(ConfigurableIOManager):
             'supabase_dim_products': 'dim_products',
             'supabase_fact_products': 'fact_products',
             'supabase_fact_certificates': 'fact_certificates',
+            'supabase_fact_cola_applications': 'fact_cola_applications',
             # Fallback mappings
             'ttb_reference_data': ['ttb_product_class_types', 'ttb_origin_codes'],
             'dim_dates': 'dim_dates',
             'dim_companies': 'dim_companies',
             'dim_products': 'dim_products',
             'fact_products': 'fact_products',
-            'fact_certificates': 'fact_certificates'
+            'fact_certificates': 'fact_certificates',
+            'fact_cola_applications': 'fact_cola_applications'
         }
         return table_mapping.get(asset_name, asset_name)
 
+    def _get_full_table_name(self, table_name: str) -> str:
+        """Get fully qualified table name with schema prefix."""
+        return f'"{self.schema_name}".{table_name}'
+
     def _write_reference_data(self, context: OutputContext, obj: Dict[str, Any], logger):
         """Write reference data to product_class_types and origin_codes tables."""
-        client = self.supabase_resource.get_client()
+        # Use direct PostgreSQL connection for schema-prefixed tables
+        with self.supabase_resource.get_postgres_connection() as conn:
+            with conn.cursor() as cursor:
+                # Write product class types
+                if 'product_class_types' in obj:
+                    logger.info(f"Writing {len(obj['product_class_types'])} product class types")
+                    full_table = self._get_full_table_name('ttb_product_class_types')
+                    for item in obj['product_class_types']:
+                        try:
+                            cursor.execute(f"""
+                                INSERT INTO {full_table} (code, description)
+                                VALUES (%s, %s)
+                                ON CONFLICT (code)
+                                DO UPDATE SET description = EXCLUDED.description
+                            """, (item.get('code', ''), item.get('description', '')))
+                        except Exception as e:
+                            logger.warning(f"Failed to upsert product class type {item}: {e}")
 
-        # Write product class types
-        if 'product_class_types' in obj:
-            logger.info(f"Writing {len(obj['product_class_types'])} product class types")
-            for item in obj['product_class_types']:
-                try:
-                    result = client.table('ttb_product_class_types').upsert({
-                        'code': item.get('code', ''),
-                        'description': item.get('description', '')
-                    }).execute()
-                except Exception as e:
-                    logger.warning(f"Failed to upsert product class type {item}: {e}")
+                # Write origin codes
+                if 'origin_codes' in obj:
+                    logger.info(f"Writing {len(obj['origin_codes'])} origin codes")
+                    full_table = self._get_full_table_name('ttb_origin_codes')
+                    for item in obj['origin_codes']:
+                        try:
+                            cursor.execute(f"""
+                                INSERT INTO {full_table} (code, description)
+                                VALUES (%s, %s)
+                                ON CONFLICT (code)
+                                DO UPDATE SET description = EXCLUDED.description
+                            """, (item.get('code', ''), item.get('description', '')))
+                        except Exception as e:
+                            logger.warning(f"Failed to upsert origin code {item}: {e}")
 
-        # Write origin codes
-        if 'origin_codes' in obj:
-            logger.info(f"Writing {len(obj['origin_codes'])} origin codes")
-            for item in obj['origin_codes']:
-                try:
-                    result = client.table('ttb_origin_codes').upsert({
-                        'code': item.get('code', ''),
-                        'description': item.get('description', '')
-                    }).execute()
-                except Exception as e:
-                    logger.warning(f"Failed to upsert origin code {item}: {e}")
+                conn.commit()
 
     def _write_dimension_data(self, context: OutputContext, obj: Dict[str, Any], table_name: str, logger):
         """Write dimension data using bulk upsert."""
@@ -165,6 +181,9 @@ class SupabaseIOManager(ConfigurableIOManager):
         if not records:
             return
 
+        # Get fully qualified table name with schema
+        full_table_name = self._get_full_table_name(table_name)
+
         # Get field names from first record
         fields = list(records[0].keys())
 
@@ -182,7 +201,7 @@ class SupabaseIOManager(ConfigurableIOManager):
         ])
 
         query = f"""
-            INSERT INTO {table_name} ({field_names})
+            INSERT INTO {full_table_name} ({field_names})
             VALUES ({placeholders})
             ON CONFLICT ({primary_key})
             DO UPDATE SET {update_clause}
@@ -203,15 +222,18 @@ class SupabaseIOManager(ConfigurableIOManager):
 
         try:
             cursor.executemany(query, data_tuples)
-            logger.info(f"Successfully upserted {len(data_tuples)} records to {table_name}")
+            logger.info(f"Successfully upserted {len(data_tuples)} records to {full_table_name}")
         except Exception as e:
-            logger.error(f"Error in bulk upsert for {table_name}: {e}")
+            logger.error(f"Error in bulk upsert for {full_table_name}: {e}")
             raise
 
     def _bulk_upsert_fact(self, cursor, table_name: str, records: List[Dict], logger):
         """Perform bulk upsert for fact tables."""
         if not records:
             return
+
+        # Get fully qualified table name with schema
+        full_table_name = self._get_full_table_name(table_name)
 
         # Get field names from first record
         fields = list(records[0].keys())
@@ -229,7 +251,7 @@ class SupabaseIOManager(ConfigurableIOManager):
         ])
 
         query = f"""
-            INSERT INTO {table_name} ({field_names})
+            INSERT INTO {full_table_name} ({field_names})
             VALUES ({placeholders})
             ON CONFLICT ({primary_key})
             DO UPDATE SET {update_clause}
@@ -243,9 +265,9 @@ class SupabaseIOManager(ConfigurableIOManager):
 
         try:
             cursor.executemany(query, data_tuples)
-            logger.info(f"Successfully upserted {len(data_tuples)} records to {table_name}")
+            logger.info(f"Successfully upserted {len(data_tuples)} records to {full_table_name}")
         except Exception as e:
-            logger.error(f"Error in bulk upsert for {table_name}: {e}")
+            logger.error(f"Error in bulk upsert for {full_table_name}: {e}")
             raise
 
     def _get_primary_key(self, table_name: str) -> str:
@@ -255,6 +277,7 @@ class SupabaseIOManager(ConfigurableIOManager):
             'dim_companies': 'company_id',
             'dim_products': 'product_id',
             'fact_products': 'product_fact_id',
-            'fact_certificates': 'certificate_fact_id'
+            'fact_certificates': 'certificate_fact_id',
+            'fact_cola_applications': 'product_fact_id'
         }
         return primary_keys.get(table_name, 'id')

@@ -3,7 +3,8 @@ Supabase Export Assets
 
 Assets for exporting TTB data from S3 to Supabase tables for analytics and visualization.
 """
-from typing import Dict, Any
+import hashlib
+from typing import Dict, Any, List
 from dagster import (
     asset,
     get_dagster_logger,
@@ -256,6 +257,7 @@ def supabase_fact_certificates(context, config: SupabaseExportConfig, fact_certi
             'status': record.get('status'),
             'serial_number': record.get('serial_number'),
             'vendor_code': record.get('vendor_code'),
+            'receipt_method': record.get('receipt_method'),
             'filing_date': record.get('filing_date'),
             'approval_date': record.get('approval_date'),
             'expiration_date': record.get('expiration_date'),
@@ -326,6 +328,215 @@ def supabase_fact_products(context, config: SupabaseExportConfig, fact_products:
     return {"records": transformed_records}
 
 
+def _create_cola_application_id(ttb_id: str) -> int:
+    """Create unique COLA application ID from TTB ID."""
+    key_string = f"cola_{ttb_id}"
+    return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)
+
+
+def _calculate_days_to_approval(record: Dict[str, Any]) -> int:
+    """Calculate days between filing/application date and approval date."""
+    from datetime import datetime
+
+    approval_date = record.get('approval_date')
+    filing_date = record.get('filing_date') or record.get('application_date')
+
+    if not approval_date or not filing_date:
+        return None
+
+    try:
+        # Handle string dates
+        if isinstance(approval_date, str):
+            approval_dt = datetime.fromisoformat(approval_date.replace('Z', '+00:00'))
+        else:
+            approval_dt = approval_date
+
+        if isinstance(filing_date, str):
+            filing_dt = datetime.fromisoformat(filing_date.replace('Z', '+00:00'))
+        else:
+            filing_dt = filing_date
+
+        return (approval_dt - filing_dt).days
+    except Exception:
+        return None
+
+
+def _create_date_id(date_val) -> int:
+    """Convert date to date_id format (YYYYMMDD)."""
+    from datetime import datetime, date
+
+    if not date_val:
+        return None
+
+    try:
+        if isinstance(date_val, str):
+            dt = datetime.fromisoformat(date_val.replace('Z', '+00:00'))
+            return int(dt.strftime('%Y%m%d'))
+        elif isinstance(date_val, datetime):
+            return int(date_val.strftime('%Y%m%d'))
+        elif isinstance(date_val, date):
+            return int(date_val.strftime('%Y%m%d'))
+    except Exception:
+        pass
+
+    return None
+
+
+@asset(
+    partitions_def=daily_partitions,
+    group_name="ttb_supabase_export",
+    description="Export complete COLA application data to Supabase with all fields",
+    ins={"ttb_extracted_data": AssetIn()},
+    io_manager_key="supabase_io_manager"
+)
+def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_extracted_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Export COLA application data to Supabase fact_cola_applications table.
+
+    This asset exports ALL fields extracted from HTML content with proper
+    column separation (no JSONB nesting), including:
+    - All product and classification details
+    - Separate ct_code and or_code columns
+    - Separate signature columns
+    - Consolidated type_of_product and source_of_product as strings
+    - Calculated days_to_approval
+    - Receipt method tracking
+    """
+    logger = get_dagster_logger()
+
+    logger.info(f"Exporting COLA applications to Supabase for partition {context.partition_key}")
+
+    # Get extracted records from the input
+    extracted_records = ttb_extracted_data.get('extracted_records', [])
+
+    if not extracted_records:
+        logger.warning("No extracted records found")
+        return {"records": []}
+
+    logger.info(f"Exporting {len(extracted_records)} COLA application records")
+
+    # Transform extracted records for Supabase (all fields as separate columns)
+    transformed_records = []
+    for record in extracted_records:
+        ttb_id = record.get('ttb_id', '')
+
+        # Extract ct_code and or_code from ttb_codes if nested
+        ttb_codes = record.get('ttb_codes', {}) or {}
+        ct_code = record.get('ct_code') or ttb_codes.get('ct_code')
+        or_code = record.get('or_code') or ttb_codes.get('or_code')
+
+        # Extract signatures from nested structure if needed
+        signatures = record.get('signatures', {}) or {}
+        applicant_signature = record.get('applicant_signature') or signatures.get('applicant_signature')
+        ttb_authorized_signature = record.get('ttb_authorized_signature') or signatures.get('authorized_signature_url')
+
+        # Get type_of_product and source_of_product as strings
+        type_of_product = record.get('type_of_product')
+        source_of_product = record.get('source_of_product')
+
+        # If source_of_product is still a dict (legacy), convert to string
+        if isinstance(source_of_product, dict):
+            if source_of_product.get('domestic'):
+                source_of_product = 'DOMESTIC'
+            elif source_of_product.get('imported'):
+                source_of_product = 'IMPORTED'
+            else:
+                source_of_product = None
+
+        # If type_of_product is still a dict (legacy), convert to string
+        product_type = record.get('product_type', {}) or {}
+        if isinstance(product_type, dict) and not type_of_product:
+            if product_type.get('wine'):
+                type_of_product = 'WINE'
+            elif product_type.get('distilled_spirits'):
+                type_of_product = 'DISTILLED SPIRITS'
+            elif product_type.get('malt_beverage'):
+                type_of_product = 'MALT BEVERAGE'
+
+        transformed_record = {
+            # Primary identification
+            'product_fact_id': _create_cola_application_id(ttb_id),
+            'ttb_id': ttb_id,
+            'serial_number': record.get('serial_number'),
+            'vendor_code': record.get('vendor_code'),
+            'rep_id_no': record.get('rep_id_no'),
+            'receipt_method': record.get('receipt_method'),
+
+            # Foreign keys (will be populated by lookup if available)
+            'company_id': record.get('company_id'),
+            'product_id': record.get('product_id'),
+            'filing_date_id': _create_date_id(record.get('filing_date') or record.get('application_date')),
+            'approval_date_id': _create_date_id(record.get('approval_date')),
+            'expiration_date_id': _create_date_id(record.get('expiration_date')),
+
+            # Product classification (separate columns, not JSONB)
+            'class_type_code': record.get('class_type_code'),
+            'origin_code': record.get('origin_code'),
+            'ct_code': ct_code,
+            'or_code': or_code,
+            'product_category': record.get('product_category'),
+            'type_of_product': type_of_product,
+            'source_of_product': source_of_product,
+
+            # Product details
+            'brand_name': record.get('brand_name'),
+            'fanciful_name': record.get('fanciful_name'),
+            'formula': record.get('formula'),
+            'grape_varietals': record.get('grape_varietals'),
+            'wine_appellation': record.get('wine_appellation'),
+            'wine_vintage': record.get('wine_vintage'),
+            'total_bottle_capacity': record.get('total_bottle_capacity'),
+            'for_sale_in': record.get('for_sale_in'),
+            'type_of_application': record.get('type_of_application'),
+
+            # Status and qualifications
+            'status': record.get('status'),
+            'qualifications': record.get('qualifications'),
+            'additional_information': record.get('additional_information'),
+
+            # Dates
+            'filing_date': record.get('filing_date') or record.get('application_date'),
+            'approval_date': record.get('approval_date'),
+            'application_date': record.get('application_date'),
+            'expiration_date': record.get('expiration_date'),
+            'days_to_approval': _calculate_days_to_approval(record),
+
+            # Signatures (separate columns, not JSONB)
+            'applicant_signature': applicant_signature,
+            'applicant_name': record.get('applicant_name') or record.get('applicant_business_name'),
+            'ttb_authorized_signature': ttb_authorized_signature,
+
+            # Permit reference
+            'permit_number_fk': record.get('plant_registry_number'),
+            'plant_registry_number': record.get('plant_registry_number'),
+
+            # Quality metrics
+            'final_quality_score': record.get('final_quality_score'),
+            'data_completeness_score': record.get('data_completeness_score'),
+            'has_certificate_data': record.get('has_certificate', False) or record.get('data_type') == 'certificate',
+            'has_cola_detail_data': record.get('has_cola_detail', False) or record.get('data_type') == 'cola-detail',
+
+            # Partition and timestamps
+            'partition_date': record.get('partition_date') or context.partition_key,
+            'fact_creation_timestamp': record.get('extraction_timestamp'),
+            'source_extraction_timestamp': record.get('extraction_timestamp'),
+            'source_cleaning_timestamp': record.get('cleaning_timestamp'),
+            'source_structuring_timestamp': record.get('structuring_timestamp')
+        }
+        transformed_records.append(transformed_record)
+
+    logger.info(f"Transformed {len(transformed_records)} COLA application records for Supabase")
+
+    # Count by receipt method for logging
+    receipt_counts = {}
+    for r in transformed_records:
+        rm = r.get('receipt_method')
+        receipt_counts[rm] = receipt_counts.get(rm, 0) + 1
+    logger.info(f"Receipt methods: {receipt_counts}")
+
+    return {"records": transformed_records}
+
+
 # Full Supabase export job
 @asset(
     partitions_def=daily_partitions,
@@ -337,7 +548,8 @@ def supabase_fact_products(context, config: SupabaseExportConfig, fact_products:
         "supabase_dim_companies": AssetIn(),
         "supabase_dim_products": AssetIn(),
         "supabase_fact_products": AssetIn(),
-        "supabase_fact_certificates": AssetIn()
+        "supabase_fact_certificates": AssetIn(),
+        "supabase_fact_cola_applications": AssetIn()
     }
 )
 def ttb_supabase_export_complete(
@@ -348,7 +560,8 @@ def ttb_supabase_export_complete(
     supabase_dim_companies: Dict[str, Any],
     supabase_dim_products: Dict[str, Any],
     supabase_fact_products: Dict[str, Any],
-    supabase_fact_certificates: Dict[str, Any]
+    supabase_fact_certificates: Dict[str, Any],
+    supabase_fact_cola_applications: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Summary asset indicating complete TTB export to Supabase."""
     logger = get_dagster_logger()
@@ -366,7 +579,8 @@ def ttb_supabase_export_complete(
         },
         'facts': {
             'products': len(supabase_fact_products.get('records', [])),
-            'certificates': len(supabase_fact_certificates.get('records', []))
+            'certificates': len(supabase_fact_certificates.get('records', [])),
+            'cola_applications': len(supabase_fact_cola_applications.get('records', []))
         },
         'export_timestamp': context.run_id
     }

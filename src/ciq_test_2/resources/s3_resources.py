@@ -18,10 +18,10 @@ class TTBStorageResource(ConfigurableResource):
 
     bucket_name: str = "ciq-dagster"
     region_name: str = "us-east-1"
-    raw_data_prefix: str = "1-ttb-raw-data"
-    processed_data_prefix: str = "2-ttb-processed-data"
-    consolidated_data_prefix: str = "3-ttb-consolidated"
-    analytics_data_prefix: str = "4-ttb-analytics"
+    raw_data_prefix: str = "ttb-pre-prod/ttb_raw_data"
+    processed_data_prefix: str = "ttb-pre-prod/ttb_processed_data"
+    consolidated_data_prefix: str = "ttb-pre-prod/ttb_consolidated"
+    analytics_data_prefix: str = "ttb-pre-prod/ttb_analytics"
 
     def get_s3_client(self):
         """Get configured S3 client."""

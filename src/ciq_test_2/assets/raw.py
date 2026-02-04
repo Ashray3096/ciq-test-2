@@ -5,6 +5,7 @@ This module contains assets for raw data extraction from external sources.
 Raw assets are the entry point to the TTB pipeline and handle data ingestion.
 """
 import os
+import time
 import tempfile
 import urllib3
 import hashlib
@@ -22,6 +23,7 @@ from dagster import (
 )
 
 from ..utils.ttb_utils import TTBIDUtils, TTBSequenceTracker
+from ..utils.ttb_supabase_loader import TTBSupabaseLoader
 from ..config.ttb_config import TTBExtractionConfig
 from ..config.ttb_partitions import daily_partitions
 
@@ -54,13 +56,13 @@ def is_ttb_error_page(content: bytes) -> bool:
     metadata={
         "data_type": "raw",
         "source": "ttbonline.gov",
-        "format": "html"
+        "format": "pickle"
     }
 )
 def ttb_raw_data(
     context: AssetExecutionContext,
     config: TTBExtractionConfig
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Extract raw TTB data for a specific date, processing all receipt methods and data types.
 
@@ -68,13 +70,23 @@ def ttb_raw_data(
     - Rate limiting (0.5s between requests)
     - Intelligent sequence detection (stop after configurable consecutive failures)
     - Comprehensive logging and metadata
-    - Returns raw HTML data for IO Manager to store
+    - Organizes data by receipt method for nested S3 storage
     - Processes both COLA detail and certificate data for all receipt methods
 
     Partition key format: date (e.g. "2024-01-01")
 
     Returns:
-        List of dictionaries containing TTB records with HTML content
+        Dictionary organized by receipt method:
+        {
+            "by_receipt_method": {
+                0: {"records": [...], "stats": {...}},  # hand-delivered
+                1: {"records": [...], "stats": {...}},  # e-filed
+                2: {"records": [...], "stats": {...}},  # mailed
+                3: {"records": [...], "stats": {...}},  # overnight
+            },
+            "all_records": [...],  # flat list for backward compatibility
+            "summary": {...}  # overall statistics
+        }
     """
     logger = get_dagster_logger()
 
@@ -86,14 +98,47 @@ def ttb_raw_data(
 
     # Configure data types and receipt methods for daily processing
     data_types = ["cola-detail", "certificate"]
-    receipt_methods = [1]  # Primary receipt method
+    receipt_methods = config.receipt_methods  # All methods: [0, 1, 2, 3]
 
     logger.info(f"Data types: {data_types}")
-    logger.info(f"Receipt methods: {receipt_methods}")
+    logger.info(f"Receipt methods: {receipt_methods} (0=hand-delivered, 1=e-filed, 2=mailed, 3=overnight)")
 
-    # Initialize tracking
+    # Initialize Supabase loader for resume functionality
+    supabase_loader = None
+    start_sequences = {method: 1 for method in receipt_methods}  # Default: start from 1
+
+    # Get Supabase credentials from config or environment variables
+    supabase_url = config.supabase_url or os.environ.get("SUPABASE_URL", "")
+    supabase_key = config.supabase_key or os.environ.get("SUPABASE_KEY", "")
+
+    if config.resume_from_supabase and supabase_url and supabase_key:
+        try:
+            supabase_loader = TTBSupabaseLoader(
+                url=supabase_url,
+                key=supabase_key,
+                schema=config.supabase_schema
+            )
+            # Get max sequences for all receipt methods at once (cached)
+            max_sequences = supabase_loader.get_max_sequence_per_receipt_method(date_str)
+
+            for method in receipt_methods:
+                existing_max = max_sequences.get(method, 0)
+                if existing_max > 0:
+                    start_sequences[method] = existing_max + 1
+                    logger.info(f"Resume enabled: method={method} will start from sequence {start_sequences[method]} (found {existing_max} in Supabase)")
+                else:
+                    logger.info(f"No existing data in Supabase for method={method}, starting from sequence 1")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Supabase loader for resume: {e}. Starting from sequence 1 for all methods.")
+    elif config.resume_from_supabase:
+        logger.warning("Resume from Supabase enabled but missing URL or key. Starting from sequence 1.")
+
+    # Initialize tracking - organize by receipt method
     all_extracted_records = []
+    records_by_method = {method: [] for method in receipt_methods}  # Organize records by receipt method
+    stats_by_method = {method: {"total": 0, "cola_detail": 0, "certificate": 0, "failed": 0} for method in receipt_methods}
     total_failed_count = 0
+    completeness_reports = {}  # Store completeness reports per method/type
 
     # Generate TTB IDs for this partition
     julian_day = TTBIDUtils.date_to_julian(partition_date)
@@ -113,11 +158,17 @@ def ttb_raw_data(
                     logger.warning(f"Unknown data_type: {data_type}, skipping...")
                     continue
 
-                # Initialize tracking for this combination
-                sequence_tracker = TTBSequenceTracker(max_consecutive_failures=config.consecutive_failure_threshold)
+                # Initialize enhanced tracking for this combination
+                sequence_tracker = TTBSequenceTracker(
+                    max_consecutive_failures=config.consecutive_failure_threshold,
+                    gap_probe_intervals=config.gap_probe_intervals,
+                    enable_gap_detection=config.enable_gap_detection
+                )
                 failed_count = 0
 
-                sequence = 1
+                # Use start sequence from Supabase resume or default to 1
+                start_sequence = start_sequences.get(receipt_method, 1)
+                sequence = start_sequence
                 while sequence <= config.max_sequence_per_batch:
                     # Build TTB ID
                     ttb_id = TTBIDUtils.build_ttb_id(
@@ -134,8 +185,22 @@ def ttb_raw_data(
                         # Rate limiting
                         TTBIDUtils.rate_limit_sleep()
 
-                        # Make request
-                        response = requests.get(url, stream=True, verify=False, timeout=30)
+                        # Make request with retry logic for connection errors
+                        response = None
+                        for retry_attempt in range(config.max_retries):
+                            try:
+                                response = requests.get(url, stream=True, verify=False, timeout=30)
+                                break  # Success, exit retry loop
+                            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as conn_err:
+                                if retry_attempt < config.max_retries - 1:
+                                    wait_time = (retry_attempt + 1) * 2  # Exponential backoff: 2, 4, 6 seconds
+                                    logger.warning(f"Connection error for {ttb_id}, retrying in {wait_time}s (attempt {retry_attempt + 1}/{config.max_retries}): {conn_err}")
+                                    time.sleep(wait_time)
+                                else:
+                                    raise  # Re-raise on final attempt
+
+                        if response is None:
+                            raise requests.exceptions.ConnectionError("Failed after all retries")
 
                         if 200 <= response.status_code < 300:
                             # Get full response content to check for error page
@@ -144,15 +209,15 @@ def ttb_raw_data(
                             # Check if this is a TTB error page
                             if is_ttb_error_page(content):
                                 # This is an error page - treat as failure
-                                sequence_tracker.record_failure()
+                                sequence_tracker.record_failure(sequence)
                                 failed_count += 1
 
                                 if sequence_tracker.should_stop():
-                                    logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive error pages")
+                                    logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive error pages at sequence {sequence}")
                                     break
                             else:
                                 # Valid content - collect the data
-                                sequence_tracker.record_success()
+                                sequence_tracker.record_success(sequence)
 
                                 # Store the extracted record with metadata
                                 record = {
@@ -169,29 +234,42 @@ def ttb_raw_data(
                                 }
 
                                 all_extracted_records.append(record)
+                                records_by_method[receipt_method].append(record)
+                                stats_by_method[receipt_method]["total"] += 1
+                                if data_type == "cola-detail":
+                                    stats_by_method[receipt_method]["cola_detail"] += 1
+                                else:
+                                    stats_by_method[receipt_method]["certificate"] += 1
                                 logger.debug(f"Successfully extracted TTB {data_type} ID: {ttb_id}")
                         else:
                             # HTTP error
-                            sequence_tracker.record_failure()
+                            sequence_tracker.record_failure(sequence)
                             failed_count += 1
 
                             if sequence_tracker.should_stop():
-                                logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive failures")
+                                logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive failures at sequence {sequence}")
                                 break
 
                     except Exception as e:
-                        sequence_tracker.record_failure()
+                        sequence_tracker.record_failure(sequence)
                         failed_count += 1
                         logger.error(f"Error processing TTB ID {ttb_id}: {e}")
 
                         if sequence_tracker.should_stop():
-                            logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive failures")
+                            logger.info(f"Stopping {data_type}/{receipt_method} after {sequence_tracker.consecutive_failures} consecutive failures at sequence {sequence}")
                             break
 
                     sequence += 1
 
+                # Store completeness report for this combination
+                report_key = f"{receipt_method}_{data_type}"
+                completeness_reports[report_key] = sequence_tracker.get_completeness_report()
+
+                # Log stats including gap detection info
+                stats = sequence_tracker.get_stats()
                 total_failed_count += failed_count
-                logger.info(f"Completed {data_type}/{receipt_method}: {len([r for r in all_extracted_records if r['data_type'] == data_type and r['receipt_method'] == receipt_method])} successful, {failed_count} failed")
+                stats_by_method[receipt_method]["failed"] += failed_count
+                logger.info(f"Completed {data_type}/{receipt_method}: {stats['total_success']} successful, {failed_count} failed, {stats['gaps_detected']} gaps detected")
 
     except Exception as e:
         logger.error(f"Critical error in TTB extraction: {e}")
@@ -211,6 +289,22 @@ def ttb_raw_data(
     logger.info(f"Total failed attempts: {total_failed_count}")
     logger.info(f"Overall success rate: {success_rate:.2%}")
 
+    # Aggregate completeness metrics
+    total_gaps = sum(r.get('gaps_detected', 0) for r in completeness_reports.values())
+    total_missing = sum(r.get('total_missing_in_gaps', 0) for r in completeness_reports.values())
+
+    # Build per-method summary for metadata
+    method_labels = {0: "hand_delivered", 1: "e_filed", 2: "mailed", 3: "overnight"}
+    per_method_summary = {}
+    for method, stats in stats_by_method.items():
+        method_name = method_labels.get(method, f"method_{method}")
+        per_method_summary[method_name] = {
+            "total_records": stats["total"],
+            "cola_detail": stats["cola_detail"],
+            "certificate": stats["certificate"],
+            "failed": stats["failed"]
+        }
+
     # Add metadata to context
     context.add_output_metadata({
         "partition_date": MetadataValue.text(date_str),
@@ -221,7 +315,39 @@ def ttb_raw_data(
         "success_rate": MetadataValue.float(success_rate),
         "total_sequences_processed": MetadataValue.int(total_processed),
         "data_types_processed": MetadataValue.text(",".join(data_types)),
-        "receipt_methods_processed": MetadataValue.text(",".join(map(str, receipt_methods)))
+        "receipt_methods_processed": MetadataValue.text(",".join(map(str, receipt_methods))),
+        "gaps_detected": MetadataValue.int(total_gaps),
+        "total_missing_in_gaps": MetadataValue.int(total_missing),
+        "completeness_reports": MetadataValue.json(completeness_reports),
+        "per_method_summary": MetadataValue.json(per_method_summary),
+        "resume_from_supabase": MetadataValue.bool(config.resume_from_supabase),
+        "start_sequences": MetadataValue.json(start_sequences)
     })
 
-    return all_extracted_records
+    # Return organized structure for nested S3 storage
+    return {
+        "by_receipt_method": {
+            method: {
+                "records": records_by_method[method],
+                "stats": stats_by_method[method],
+                "completeness": {
+                    k: v for k, v in completeness_reports.items()
+                    if k.startswith(f"{method}_")
+                }
+            }
+            for method in receipt_methods
+        },
+        "all_records": all_extracted_records,  # Flat list for backward compatibility
+        "summary": {
+            "partition_date": date_str,
+            "total_records": len(all_extracted_records),
+            "total_failed": total_failed_count,
+            "success_rate": success_rate,
+            "per_method_stats": stats_by_method,
+            "completeness_reports": completeness_reports,
+            "gaps_detected": total_gaps,
+            "total_missing_in_gaps": total_missing,
+            "resume_from_supabase": config.resume_from_supabase,
+            "start_sequences": start_sequences
+        }
+    }

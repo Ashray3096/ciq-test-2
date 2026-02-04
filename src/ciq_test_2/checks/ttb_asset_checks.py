@@ -918,3 +918,218 @@ def check_certificate_compliance_monitoring(context: AssetCheckExecutionContext,
             description=f"Check failed due to error: {str(e)}",
             metadata={"error": str(e)}
         )
+
+
+@asset_check(
+    asset=ttb_raw_data,
+    name="sequence_completeness",
+    description="Check that TTB sequence extraction is complete without significant gaps"
+)
+def check_sequence_completeness(context: AssetCheckExecutionContext, ttb_raw_data) -> AssetCheckResult:
+    """
+    Verify that TTB sequence extraction is complete.
+
+    Checks for:
+    - All receipt methods processed
+    - No significant gaps in sequences
+    - Expected volume ranges
+    """
+    logger = get_dagster_logger()
+
+    try:
+        # Handle different data formats
+        if isinstance(ttb_raw_data, list):
+            records = ttb_raw_data
+            # Try to get completeness reports from context metadata
+            completeness_reports = {}
+        elif isinstance(ttb_raw_data, dict):
+            records = ttb_raw_data.get('records', [])
+            completeness_reports = ttb_raw_data.get('completeness_reports', {})
+        else:
+            records = []
+            completeness_reports = {}
+
+        issues = []
+        warnings = []
+
+        # Expected receipt methods
+        expected_methods = {0, 1, 2, 3}
+        found_methods = set()
+
+        total_records = len(records) if isinstance(records, list) else 0
+        total_gaps = 0
+        total_missing = 0
+
+        # Analyze completeness reports if available
+        if completeness_reports:
+            for key, report in completeness_reports.items():
+                parts = key.split('_')
+                if len(parts) >= 1:
+                    try:
+                        found_methods.add(int(parts[0]))
+                    except ValueError:
+                        pass
+
+                total_gaps += report.get('gaps_detected', 0)
+                total_missing += report.get('total_missing_in_gaps', 0)
+
+                # Check completeness ratio
+                ratio = report.get('completeness_ratio', 0)
+                if ratio < 0.95 and ratio > 0:
+                    warnings.append(f"{key}: Low completeness ratio {ratio:.1%}")
+
+                # Check for significant gaps
+                gap_details = report.get('gap_details', [])
+                large_gaps = [g for g in gap_details if g.get('size', 0) > 10]
+                if large_gaps:
+                    issues.append(f"{key}: {len(large_gaps)} large gaps (>10 sequences)")
+        else:
+            # Analyze records directly if no completeness reports
+            for record in records:
+                receipt_method = record.get('receipt_method')
+                if receipt_method is not None:
+                    found_methods.add(receipt_method)
+
+        # Check all receipt methods processed
+        missing_methods = expected_methods - found_methods
+        if missing_methods and len(found_methods) > 0:
+            # Only warn if we have some methods but not all
+            method_labels = {0: "hand-delivered", 1: "e-filed", 2: "mailed", 3: "overnight"}
+            missing_labels = [method_labels.get(m, str(m)) for m in missing_methods]
+            warnings.append(f"Missing receipt methods: {missing_labels}")
+
+        # Check volume thresholds
+        if total_records < 10 and total_records > 0:
+            warnings.append(f"Low record count: {total_records}")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.ERROR if issues else (
+            AssetCheckSeverity.WARN if warnings else None
+        )
+
+        description = f"Sequence completeness: {total_records} records"
+        if total_gaps > 0:
+            description += f", {total_gaps} gaps ({total_missing} missing)"
+        if issues:
+            description += f" - ISSUES: {'; '.join(issues)}"
+        elif warnings:
+            description += f" - WARNINGS: {'; '.join(warnings)}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "total_records": total_records,
+                "total_gaps": total_gaps,
+                "total_missing_sequences": total_missing,
+                "receipt_methods_found": list(found_methods),
+                "receipt_methods_missing": list(missing_methods),
+                "issues": issues,
+                "warnings": warnings,
+                "completeness_reports": completeness_reports
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in sequence completeness check: {e}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed: {e}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_raw_data,
+    name="receipt_method_coverage",
+    description="Verify all TTB receipt methods are being processed"
+)
+def check_receipt_method_coverage(context: AssetCheckExecutionContext, ttb_raw_data) -> AssetCheckResult:
+    """
+    Ensure all TTB receipt methods are being processed.
+
+    Verifies that the extraction covers:
+    - 0: Hand-delivered
+    - 1: E-filed (primary, should always have data)
+    - 2: Mailed
+    - 3: Overnight
+    """
+    logger = get_dagster_logger()
+
+    try:
+        # Handle different data formats
+        if isinstance(ttb_raw_data, list):
+            records = ttb_raw_data
+        elif isinstance(ttb_raw_data, dict):
+            records = ttb_raw_data.get('records', ttb_raw_data)
+            if not isinstance(records, list):
+                records = []
+        else:
+            records = []
+
+        # Count records by receipt method
+        method_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+
+        for record in records:
+            method = record.get('receipt_method')
+            if method in method_counts:
+                method_counts[method] += 1
+
+        # Check coverage
+        missing_methods = [m for m, count in method_counts.items() if count == 0]
+
+        method_labels = {
+            0: "hand-delivered",
+            1: "e-filed",
+            2: "mailed",
+            3: "overnight"
+        }
+
+        # E-filed (method 1) should always have data if we have any records
+        total_records = sum(method_counts.values())
+        passed = True
+        severity = None
+
+        description = "Receipt method coverage: " + ", ".join(
+            f"{method_labels[m]}={count}" for m, count in method_counts.items()
+        )
+
+        if total_records > 0:
+            if 1 in missing_methods:
+                # E-filed is the primary method - should always have data
+                passed = False
+                severity = AssetCheckSeverity.ERROR
+                description += " - ERROR: No e-filed records found!"
+            elif missing_methods:
+                # Other methods may legitimately have zero records on some days
+                severity = AssetCheckSeverity.WARN
+                description += f" - Note: No records for {[method_labels[m] for m in missing_methods]}"
+        elif total_records == 0:
+            passed = False
+            severity = AssetCheckSeverity.ERROR
+            description = "No records found for any receipt method"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "method_counts": method_counts,
+                "method_labels": method_labels,
+                "missing_methods": missing_methods,
+                "total_records": total_records,
+                "e_filed_coverage": method_counts[1] > 0,
+                "all_methods_covered": len(missing_methods) == 0
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in receipt method coverage check: {e}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed: {e}",
+            metadata={"error": str(e)}
+        )

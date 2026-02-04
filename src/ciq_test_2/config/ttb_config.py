@@ -23,11 +23,11 @@ class TTBPipelineConfig(Config):
     s3_bucket: str = "ciq-dagster"
     s3_region: str = "us-east-1"
 
-    # Data storage prefixes
-    raw_data_prefix: str = "1-ttb-raw-data"
-    processed_data_prefix: str = "2-ttb-processed-data"
-    consolidated_data_prefix: str = "3-ttb-consolidated"
-    analytics_data_prefix: str = "4-ttb-analytics"
+    # Data storage prefixes (base path: ttb-pre-prod/)
+    raw_data_prefix: str = "ttb-pre-prod/ttb_raw_data"
+    processed_data_prefix: str = "ttb-pre-prod/ttb_processed_data"
+    consolidated_data_prefix: str = "ttb-pre-prod/ttb_consolidated"
+    analytics_data_prefix: str = "ttb-pre-prod/ttb_analytics"
 
     # Pipeline behavior
     enable_data_quality_checks: bool = True
@@ -43,28 +43,50 @@ class TTBExtractionConfig(Config):
     """
     # S3 settings
     s3_bucket: str = "ciq-dagster"
-    raw_data_prefix: str = "1-ttb-raw-data"
+    raw_data_prefix: str = "ttb-pre-prod/ttb_raw_data"
+
+    # Receipt methods to process (0=hand-delivered, 1=e-filed, 2=mailed, 3=overnight)
+    receipt_methods: List[int] = [0, 1, 2, 3]
 
     # Extraction behavior
-    max_sequence_per_batch: int = 1000
-    consecutive_failure_threshold: int = 10
+    max_sequence_per_batch: int = 15000  # Increased to handle high-volume days
+    consecutive_failure_threshold: int = 50  # Lower threshold for faster testing (increase in production)
     request_delay_seconds: float = 0.5
     max_retries: int = 3
     ssl_verify: bool = False
 
+    # Gap detection settings
+    enable_gap_detection: bool = True
+    gap_probe_intervals: List[int] = [50, 100, 500, 1000]  # Probe ahead at these intervals
+    max_gap_probe_attempts: int = 5
+
     # Error handling
     stop_on_consecutive_failures: bool = True
     save_error_responses: bool = True
+
+    # Supabase resume configuration
+    # When enabled, queries ciq.fact_cola_applications to find max TTB ID
+    # and starts extraction from max_sequence + 1
+    resume_from_supabase: bool = False  # Disabled to allow full re-extraction
+    supabase_url: str = "https://xhvsvhiysnacdinclncn.supabase.co"
+    supabase_key: str = ""  # Set via SUPABASE_KEY env var
+    supabase_schema: str = "ciq"  # Schema where fact_cola_applications exists
 
     @classmethod
     def from_env(cls) -> "TTBExtractionConfig":
         """Create config from environment variables."""
         return cls(
             s3_bucket=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
-            max_sequence_per_batch=int(EnvVar("TTB_MAX_SEQUENCE_PER_BATCH").get_value("1000")),
-            consecutive_failure_threshold=int(EnvVar("TTB_CONSECUTIVE_FAILURE_THRESHOLD").get_value("10")),
+            max_sequence_per_batch=int(EnvVar("TTB_MAX_SEQUENCE_PER_BATCH").get_value("15000")),
+            consecutive_failure_threshold=int(EnvVar("TTB_CONSECUTIVE_FAILURE_THRESHOLD").get_value("500")),
             request_delay_seconds=float(EnvVar("TTB_REQUEST_DELAY_SECONDS").get_value("0.5")),
-            ssl_verify=EnvVar("TTB_SSL_VERIFY").get_value("false").lower() == "true"
+            ssl_verify=EnvVar("TTB_SSL_VERIFY").get_value("false").lower() == "true",
+            enable_gap_detection=EnvVar("TTB_ENABLE_GAP_DETECTION").get_value("true").lower() == "true",
+            # Supabase resume settings
+            resume_from_supabase=EnvVar("TTB_RESUME_FROM_SUPABASE").get_value("true").lower() == "true",
+            supabase_url=EnvVar("SUPABASE_URL").get_value("https://xhvsvhiysnacdinclncn.supabase.co"),
+            supabase_key=EnvVar("SUPABASE_KEY").get_value(""),
+            supabase_schema=EnvVar("TTB_SUPABASE_SCHEMA").get_value("ciq")
         )
 
 
@@ -76,8 +98,8 @@ class TTBProcessingConfig(Config):
     """
     # S3 settings
     s3_bucket: str = "ciq-dagster"
-    s3_input_prefix: str = "1-ttb-raw-data"
-    s3_output_prefix: str = "2-ttb-processed-data"
+    s3_input_prefix: str = "ttb-pre-prod/ttb_raw_data"
+    s3_output_prefix: str = "ttb-pre-prod/ttb_processed_data"
 
     # Processing behavior
     processing_batch_size: int = 100
@@ -104,7 +126,7 @@ class TTBConsolidationConfig(Config):
     """
     # S3 settings
     bucket_name: str = "ciq-dagster"
-    s3_output_prefix: str = "3-ttb-consolidated"
+    s3_output_prefix: str = "ttb-pre-prod/ttb_consolidated"
 
     # Consolidation behavior
     create_partitioned_output: bool = True
@@ -124,7 +146,7 @@ class TTBAnalyticsConfig(Config):
     """
     # S3 settings
     s3_bucket: str = "ciq-dagster"
-    output_prefix: str = "4-ttb-analytics"
+    output_prefix: str = "ttb-pre-prod/ttb_analytics"
 
     # Dimensional modeling
     date_dimension_start_year: int = 2015

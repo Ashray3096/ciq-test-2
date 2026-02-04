@@ -9,8 +9,8 @@ TTB ID Structure (14 digits): YYJJJRRRSSSSS
 """
 import time
 from datetime import datetime, date, timedelta
-from typing import NamedTuple, Iterator, Optional, List
-from dataclasses import dataclass
+from typing import NamedTuple, Iterator, Optional, List, Set, Dict, Any
+from dataclasses import dataclass, field
 
 
 class TTBIDComponents(NamedTuple):
@@ -184,47 +184,223 @@ class TTBIDUtils:
         time.sleep(0.5)
 
 
-class TTBSequenceTracker:
-    """Tracks consecutive failures to detect end of sequence."""
+@dataclass
+class SequenceGap:
+    """Represents a detected gap in TTB sequences."""
+    start_sequence: int
+    end_sequence: int
+    gap_size: int = field(init=False)
 
-    def __init__(self, max_consecutive_failures: int = 5):
+    def __post_init__(self):
+        self.gap_size = self.end_sequence - self.start_sequence - 1
+
+
+class TTBSequenceTracker:
+    """
+    Enhanced tracker with gap detection and completeness monitoring.
+
+    Tracks consecutive failures to detect end of sequence, while also
+    tracking all successful/failed sequences for gap detection.
+    """
+
+    def __init__(
+        self,
+        max_consecutive_failures: int = 500,
+        gap_probe_intervals: List[int] = None,
+        enable_gap_detection: bool = True
+    ):
         self.max_consecutive_failures = max_consecutive_failures
+        self.gap_probe_intervals = gap_probe_intervals or [50, 100, 500, 1000]
+        self.enable_gap_detection = enable_gap_detection
+
+        # Basic tracking state
         self.consecutive_failures = 0
         self.total_processed = 0
         self.total_success = 0
         self.total_failures = 0
 
-    def record_success(self):
-        """Record a successful request."""
+        # Sequence tracking for gap detection
+        self.successful_sequences: Set[int] = set()
+        self.failed_sequences: Set[int] = set()
+        self.detected_gaps: List[SequenceGap] = []
+
+        # Range tracking
+        self.min_sequence_found: Optional[int] = None
+        self.max_sequence_found: Optional[int] = None
+        self.last_successful_sequence: Optional[int] = None
+
+        # Probe state for gap detection
+        self.probe_results: Dict[int, bool] = {}
+
+    def record_success(self, sequence: int = None):
+        """
+        Record a successful request with optional sequence tracking.
+
+        Args:
+            sequence: The sequence number that was successful
+        """
         self.consecutive_failures = 0
         self.total_processed += 1
         self.total_success += 1
 
-    def record_failure(self):
-        """Record a failed request."""
+        if sequence is not None:
+            self.successful_sequences.add(sequence)
+            self.last_successful_sequence = sequence
+
+            # Update range tracking
+            if self.min_sequence_found is None or sequence < self.min_sequence_found:
+                self.min_sequence_found = sequence
+            if self.max_sequence_found is None or sequence > self.max_sequence_found:
+                self.max_sequence_found = sequence
+
+    def record_failure(self, sequence: int = None):
+        """
+        Record a failed request with optional sequence tracking.
+
+        Args:
+            sequence: The sequence number that failed
+        """
         self.consecutive_failures += 1
         self.total_processed += 1
         self.total_failures += 1
+
+        if sequence is not None:
+            self.failed_sequences.add(sequence)
 
     def should_stop(self) -> bool:
         """Check if we should stop processing due to consecutive failures."""
         return self.consecutive_failures >= self.max_consecutive_failures
 
-    def get_stats(self) -> dict:
-        """Get processing statistics."""
+    def should_probe_ahead(self) -> bool:
+        """Determine if we should probe ahead for more sequences."""
+        if not self.enable_gap_detection:
+            return False
+        return self.consecutive_failures >= self.max_consecutive_failures
+
+    def get_probe_sequences(self, current_sequence: int, max_sequence: int) -> List[int]:
+        """
+        Get sequences to probe ahead for gap detection.
+
+        Args:
+            current_sequence: Current sequence position
+            max_sequence: Maximum sequence to check
+
+        Returns:
+            List of sequences to probe
+        """
+        probes = []
+        for interval in self.gap_probe_intervals:
+            probe_seq = current_sequence + interval
+            if probe_seq <= max_sequence and probe_seq not in self.probe_results:
+                probes.append(probe_seq)
+        return probes
+
+    def record_probe_result(self, sequence: int, found: bool):
+        """
+        Record result of a gap probe.
+
+        Args:
+            sequence: Sequence that was probed
+            found: True if data was found at this sequence
+        """
+        self.probe_results[sequence] = found
+        if found:
+            self.successful_sequences.add(sequence)
+            # Update max if this probe found data beyond current max
+            if self.max_sequence_found is None or sequence > self.max_sequence_found:
+                self.max_sequence_found = sequence
+
+    def detect_gaps(self) -> List[SequenceGap]:
+        """
+        Analyze successful sequences to detect gaps.
+
+        Returns:
+            List of detected gaps
+        """
+        if not self.successful_sequences:
+            return []
+
+        sorted_successful = sorted(self.successful_sequences)
+        gaps = []
+
+        for i in range(len(sorted_successful) - 1):
+            current = sorted_successful[i]
+            next_seq = sorted_successful[i + 1]
+
+            if next_seq - current > 1:
+                # There's a gap
+                gap = SequenceGap(
+                    start_sequence=current,
+                    end_sequence=next_seq
+                )
+                gaps.append(gap)
+
+        self.detected_gaps = gaps
+        return gaps
+
+    def get_completeness_report(self) -> Dict[str, Any]:
+        """
+        Generate a completeness report for this tracking session.
+
+        Returns:
+            Dictionary with completeness metrics
+        """
+        gaps = self.detect_gaps()
+        total_expected = (
+            self.max_sequence_found - self.min_sequence_found + 1
+            if self.min_sequence_found is not None and self.max_sequence_found is not None
+            else 0
+        )
+        total_found = len(self.successful_sequences)
+
+        return {
+            "min_sequence": self.min_sequence_found,
+            "max_sequence": self.max_sequence_found,
+            "total_expected": total_expected,
+            "total_found": total_found,
+            "total_failed": len(self.failed_sequences),
+            "completeness_ratio": total_found / total_expected if total_expected > 0 else 0,
+            "gaps_detected": len(gaps),
+            "total_missing_in_gaps": sum(g.gap_size for g in gaps),
+            "gap_details": [
+                {
+                    "start": g.start_sequence,
+                    "end": g.end_sequence,
+                    "size": g.gap_size
+                } for g in gaps
+            ],
+            "probe_results": self.probe_results
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive processing statistics."""
         return {
             "total_processed": self.total_processed,
             "total_success": self.total_success,
             "total_failures": self.total_failures,
             "consecutive_failures": self.consecutive_failures,
-            "success_rate": self.total_success / max(1, self.total_processed)
+            "success_rate": self.total_success / max(1, self.total_processed),
+            "sequences_found": len(self.successful_sequences),
+            "sequence_range": (self.min_sequence_found, self.max_sequence_found),
+            "gaps_detected": len(self.detected_gaps)
         }
 
 
 class TTBBackfillManager:
-    """Manages backward-looking backfill logic with data existence checking."""
+    """
+    Enhanced backfill manager with sequence completeness checking.
 
-    def __init__(self, s3_client, bucket_name: str, stop_after_consecutive_found: int = 3):
+    Manages backward-looking backfill logic with data existence checking
+    and sequence completeness verification.
+    """
+
+    def __init__(
+        self,
+        s3_client,
+        bucket_name: str,
+        stop_after_consecutive_found: int = 3,
+        completeness_threshold: float = 0.95
+    ):
         """
         Initialize backfill manager.
 
@@ -232,11 +408,16 @@ class TTBBackfillManager:
             s3_client: S3 client for checking data existence
             bucket_name: S3 bucket name
             stop_after_consecutive_found: Stop backfill after this many consecutive days with existing data
+            completeness_threshold: Minimum completeness ratio before triggering backfill
         """
         self.s3_client = s3_client
         self.bucket_name = bucket_name
         self.stop_after_consecutive_found = stop_after_consecutive_found
+        self.completeness_threshold = completeness_threshold
         self.consecutive_found_days = 0
+
+        # Track incomplete partitions for targeted backfill
+        self.incomplete_partitions: List[Dict[str, Any]] = []
 
     def check_partition_exists(self, target_date: date, receipt_method: int) -> bool:
         """
@@ -250,8 +431,8 @@ class TTBBackfillManager:
             True if any data exists for this partition
         """
         try:
-            # Check S3 prefix for this partition (using numbered raw data structure)
-            s3_prefix = f"1-ttb-raw-data/data_type=cola-detail/year={target_date.year}/month={target_date.month:02d}/day={target_date.day:02d}/receipt_method={receipt_method:03d}/"
+            # Check S3 prefix for this partition (using ttb-pre-prod path)
+            s3_prefix = f"ttb-pre-prod/ttb_raw_data/partition_date={target_date.isoformat()}/"
 
             response = self.s3_client.list_objects_v2(
                 Bucket=self.bucket_name,
@@ -264,6 +445,54 @@ class TTBBackfillManager:
         except Exception:
             # If we can't check, assume it doesn't exist
             return False
+
+    def check_partition_completeness(
+        self,
+        target_date: date,
+        receipt_method: int
+    ) -> Dict[str, Any]:
+        """
+        Check completeness of a partition beyond just existence.
+
+        Returns detailed completeness metrics.
+
+        Args:
+            target_date: Date to check
+            receipt_method: Receipt method code
+
+        Returns:
+            Dictionary with completeness metrics
+        """
+        result = {
+            "exists": False,
+            "record_count": 0,
+            "sequence_range": None,
+            "gaps_detected": [],
+            "completeness_ratio": 0.0,
+            "needs_backfill": False
+        }
+
+        try:
+            # Check if partition exists first
+            if not self.check_partition_exists(target_date, receipt_method):
+                result["needs_backfill"] = True
+                return result
+
+            result["exists"] = True
+
+            # For detailed completeness checking, we would need to read the actual data
+            # This is a placeholder for the full implementation
+            # In production, you would load the pickle file and analyze sequences
+
+            # Mark as complete if exists (basic check)
+            result["completeness_ratio"] = 1.0
+            result["needs_backfill"] = False
+
+        except Exception as e:
+            result["error"] = str(e)
+            result["needs_backfill"] = True
+
+        return result
 
     def should_stop_backfill(self, target_date: date, receipt_methods: List[int]) -> bool:
         """
@@ -290,6 +519,70 @@ class TTBBackfillManager:
             # Reset counter if we find missing data
             self.consecutive_found_days = 0
             return False
+
+    def identify_backfill_targets(
+        self,
+        start_date: date,
+        end_date: date,
+        receipt_methods: List[int]
+    ) -> List[Dict[str, Any]]:
+        """
+        Scan date range and identify partitions needing backfill.
+
+        Args:
+            start_date: Start of date range to scan
+            end_date: End of date range to scan
+            receipt_methods: List of receipt methods to check
+
+        Returns:
+            List of backfill targets with priority scores
+        """
+        targets = []
+
+        current_date = start_date
+        while current_date <= end_date:
+            for receipt_method in receipt_methods:
+                completeness = self.check_partition_completeness(current_date, receipt_method)
+
+                if completeness["needs_backfill"]:
+                    priority = self._calculate_backfill_priority(completeness)
+                    targets.append({
+                        "date": current_date.isoformat(),
+                        "receipt_method": receipt_method,
+                        "completeness": completeness,
+                        "priority": priority
+                    })
+
+            current_date += timedelta(days=1)
+
+        # Sort by priority (higher = more urgent)
+        targets.sort(key=lambda x: x["priority"], reverse=True)
+
+        return targets
+
+    def _calculate_backfill_priority(self, completeness: Dict[str, Any]) -> float:
+        """
+        Calculate backfill priority score.
+
+        Args:
+            completeness: Completeness check result
+
+        Returns:
+            Priority score (higher = more urgent)
+        """
+        priority = 0.0
+
+        if not completeness["exists"]:
+            priority += 100  # Missing entirely
+        else:
+            # Priority based on gaps
+            gap_size = sum(g.get("size", 0) for g in completeness.get("gaps_detected", []))
+            priority += gap_size * 2
+
+            # Priority based on completeness ratio
+            priority += (1 - completeness.get("completeness_ratio", 0)) * 50
+
+        return priority
 
     def get_backfill_date_range(self, max_days_back: int = 365) -> Iterator[date]:
         """

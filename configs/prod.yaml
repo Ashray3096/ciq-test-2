@@ -8,9 +8,11 @@ deployment_environment: "prod"
 s3:
   bucket: "ttb-production-data"  # Production bucket
   prefixes:
-    raw_data: "1-ttb-raw-data"
-    processed_data: "2-ttb-processed-data"
-    dimensional_data: "3-ttb-dimensional-data"
+    raw_data: "ttb-pre-prod/ttb_raw_data"
+    processed_data: "ttb-pre-prod/ttb_processed_data"
+    dimensional_data: "ttb-pre-prod/ttb_dimensional"
+    consolidated_data: "ttb-pre-prod/ttb_consolidated"
+    analytics_data: "ttb-pre-prod/ttb_analytics"
 
 # Processing limits for production (larger batches for efficiency)
 processing:

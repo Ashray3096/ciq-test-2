@@ -36,7 +36,7 @@ from ..utils.ttb_consolidated_schema import (
 class ConsolidatedConfig(Config):
     """Configuration for consolidated TTB assets."""
     bucket_name: str = "ciq-dagster"
-    s3_output_prefix: str = "3-ttb-consolidated"
+    s3_output_prefix: str = "ttb-pre-prod/ttb_consolidated"
     create_partitioned_output: bool = True
     data_quality_analysis: bool = True
     deduplication_enabled: bool = True
@@ -50,7 +50,7 @@ class ConsolidatedConfig(Config):
     metadata={
         "data_type": "consolidated",
         "stage": "consolidation",
-        "format": "parquet"
+        "format": "pickle"
     }
 )
 def ttb_consolidated_data(
@@ -102,7 +102,7 @@ def ttb_consolidated_data(
 
                 try:
                     # Read structured data from S3
-                    s3_prefix = f"2-ttb-processed-data/structured/{partition_date_str}/{method_type}/"
+                    s3_prefix = f"ttb-pre-prod/ttb_processed_data/structured/{partition_date_str}/{method_type}/"
 
                     # List objects for this partition
                     response = s3_client.list_objects_v2(

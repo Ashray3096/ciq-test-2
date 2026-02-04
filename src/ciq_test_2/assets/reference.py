@@ -36,7 +36,7 @@ class TTBReferenceConfig(Config):
     metadata={
         "data_type": "reference",
         "source": "ttbonline.gov",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_product_class_types(
@@ -120,7 +120,7 @@ def ttb_product_class_types(
     metadata={
         "data_type": "reference",
         "source": "ttbonline.gov",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_origin_codes(
@@ -204,7 +204,7 @@ def ttb_origin_codes(
     metadata={
         "data_type": "reference",
         "source": "combined",
-        "format": "json"
+        "format": "pickle"
     }
 )
 def ttb_reference_data(

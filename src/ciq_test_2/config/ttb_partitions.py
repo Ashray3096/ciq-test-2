@@ -15,17 +15,16 @@ def get_configurable_daily_partitions() -> DailyPartitionsDefinition:
     Get configurable daily partitions based on environment variables.
 
     Environment Variables:
-        TTB_PARTITION_START_DATE: Start date (default: 2024-01-01 for testing)
-        TTB_PARTITION_END_DATE: End date (default: 2024-01-01 for testing)
+        TTB_PARTITION_START_DATE: Start date (default: 2000-01-01 for 25+ years)
+        TTB_PARTITION_END_DATE: End date (default: 2025-12-31)
 
     Logic: Both start_date and end_date are always included, along with all days in between.
 
-    For production, set:
-        TTB_PARTITION_START_DATE=2015-01-01
-        TTB_PARTITION_END_DATE=2025-12-31
+    Default: 25+ years of data (2000-01-01 to 2025-12-31)
+    ~9,497 daily partitions
     """
-    start_date = EnvVar("TTB_PARTITION_START_DATE").get_value("2024-01-01")
-    end_date = EnvVar("TTB_PARTITION_END_DATE").get_value("2024-01-01")
+    start_date = EnvVar("TTB_PARTITION_START_DATE").get_value("2000-01-01")
+    end_date = EnvVar("TTB_PARTITION_END_DATE").get_value("2025-12-31")
 
     from datetime import datetime, timedelta
 

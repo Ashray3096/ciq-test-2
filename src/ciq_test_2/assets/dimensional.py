@@ -148,8 +148,12 @@ def dim_companies(
     companies_map = {}
 
     for record in structured_records:
-        business_name = record.get('applicant_business_name')
+        business_name = _resolve_business_name(record)
         mailing_address = record.get('applicant_mailing_address')
+
+        if not business_name:
+            logger.warning(f"Skipping record {record.get('ttb_id')} - no business name found")
+            continue
 
         if business_name:
             # Create company identifier
@@ -264,7 +268,7 @@ def dim_products(
                     'product_description': record.get('product_description', ''),
                     'class_type_code': record.get('class_type_code', ''),
                     'origin_code': record.get('origin_code', ''),
-                    'product_category': record.get('product_category', 'OTHER'),
+                    'product_category': record.get('product_category') or _infer_product_category(record.get('class_type_code', '')),
                     'grape_varietals': record.get('grape_varietals', ''),
                     'wine_appellation': record.get('cert_wine_appellation', ''),
                     'alcohol_content': record.get('alcohol_content'),
@@ -321,6 +325,29 @@ def _is_us_holiday(dt: date) -> bool:
         return True
     # Add more holidays as needed
     return False
+
+
+def _infer_product_category(class_type_code: str) -> str:
+    """Infer product category from class_type_code using keyword matching."""
+    if not class_type_code:
+        return 'OTHER'
+
+    code_lower = class_type_code.lower()
+
+    if any(kw in code_lower for kw in ['wine', 'champagne', 'port', 'sherry',
+            'vermouth', 'sake', 'mead', 'cider', 'perry', 'sparkling']):
+        return 'WINE'
+
+    if any(kw in code_lower for kw in ['tequila', 'whiskey', 'whisky', 'vodka',
+            'rum', 'gin', 'brandy', 'cognac', 'spirits', 'liqueur', 'cordial',
+            'mezcal', 'bourbon', 'scotch', 'rye', 'agave']):
+        return 'SPIRITS'
+
+    if any(kw in code_lower for kw in ['beer', 'ale', 'lager', 'malt', 'stout',
+            'porter', 'pilsner', 'ipa']):
+        return 'BEER'
+
+    return 'OTHER'
 
 
 def _get_season(month: int) -> str:
@@ -409,3 +436,42 @@ def _calculate_product_quality_score(record: Dict[str, Any]) -> float:
         score_components.append(0.1)
 
     return min(sum(score_components), 1.0)
+
+
+# Bad value patterns from HTML label parsing artifacts
+_BAD_VALUES = {'(required)', 'required', '(optional)', 'optional', 'n/a', 'none'}
+
+
+def _is_bad_value(value: Optional[str]) -> bool:
+    """Check if a value is an HTML parsing artifact."""
+    if not value:
+        return True
+    return value.strip().lower() in _BAD_VALUES
+
+
+def _resolve_business_name(record: Dict[str, Any]) -> Optional[str]:
+    """
+    Resolve business name from available fields, filtering out HTML artifacts.
+
+    Fallback chain:
+    1. applicant_business_name (primary)
+    2. cert_applicant_business_name (certificate data)
+    3. applicant_name (person who signed)
+    4. First segment of applicant_mailing_address (last resort - address often
+       contains the company name as its first comma-separated element when the
+       business name field has parsing artifacts like '(Required)')
+    """
+    # Try primary fields first
+    for field in ('applicant_business_name', 'cert_applicant_business_name', 'applicant_name'):
+        value = record.get(field)
+        if value and not _is_bad_value(value):
+            return value.strip()
+
+    # Last resort: parse business name from the address field
+    address = record.get('applicant_mailing_address', '')
+    if address:
+        first_segment = address.split(',')[0].strip()
+        if first_segment and not _is_bad_value(first_segment):
+            return first_segment
+
+    return None

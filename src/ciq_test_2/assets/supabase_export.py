@@ -44,12 +44,30 @@ def supabase_reference_data(context, config: SupabaseExportConfig, ttb_reference
     if 'product_class_types' in ttb_reference_data:
         product_types = ttb_reference_data['product_class_types']
         if isinstance(product_types, dict):
-            # Convert dictionary to list of code/description pairs
-            for code, description in product_types.items():
-                export_data['product_class_types'].append({
-                    'code': code,
-                    'description': description
-                })
+            # Check for nested structure with 'by_code' or 'all_records'
+            if 'by_code' in product_types:
+                # Use by_code dictionary for code -> description mapping
+                for code, description in product_types['by_code'].items():
+                    export_data['product_class_types'].append({
+                        'code': code,
+                        'description': description
+                    })
+            elif 'all_records' in product_types:
+                # Use all_records list
+                for item in product_types['all_records']:
+                    if isinstance(item, dict):
+                        export_data['product_class_types'].append({
+                            'code': item.get('code', ''),
+                            'description': item.get('description', '')
+                        })
+            else:
+                # Flat dictionary format
+                for code, description in product_types.items():
+                    if isinstance(description, str):
+                        export_data['product_class_types'].append({
+                            'code': code,
+                            'description': description
+                        })
         elif isinstance(product_types, list):
             # Handle list format
             for item in product_types:
@@ -63,12 +81,30 @@ def supabase_reference_data(context, config: SupabaseExportConfig, ttb_reference
     if 'origin_codes' in ttb_reference_data:
         origin_codes = ttb_reference_data['origin_codes']
         if isinstance(origin_codes, dict):
-            # Convert dictionary to list of code/description pairs
-            for code, description in origin_codes.items():
-                export_data['origin_codes'].append({
-                    'code': code,
-                    'description': description
-                })
+            # Check for nested structure with 'by_code' or 'all_records'
+            if 'by_code' in origin_codes:
+                # Use by_code dictionary for code -> description mapping
+                for code, description in origin_codes['by_code'].items():
+                    export_data['origin_codes'].append({
+                        'code': code,
+                        'description': description
+                    })
+            elif 'all_records' in origin_codes:
+                # Use all_records list
+                for item in origin_codes['all_records']:
+                    if isinstance(item, dict):
+                        export_data['origin_codes'].append({
+                            'code': item.get('code', ''),
+                            'description': item.get('description', '')
+                        })
+            else:
+                # Flat dictionary format
+                for code, description in origin_codes.items():
+                    if isinstance(description, str):
+                        export_data['origin_codes'].append({
+                            'code': code,
+                            'description': description
+                        })
         elif isinstance(origin_codes, list):
             # Handle list format
             for item in origin_codes:
@@ -241,6 +277,8 @@ def supabase_fact_certificates(context, config: SupabaseExportConfig, fact_certi
     logger.info(f"Exporting {len(records)} certificate fact records")
 
     # Transform certificate fact records for Supabase (match table schema)
+    # Note: fact_certificates has different fields than fact_products.
+    # Map certificate-specific fields to the closest Supabase column.
     transformed_records = []
     for record in records:
         transformed_record = {
@@ -248,19 +286,19 @@ def supabase_fact_certificates(context, config: SupabaseExportConfig, fact_certi
             'ttb_id': record.get('ttb_id'),
             'company_id': record.get('company_id'),
             'product_id': record.get('product_id'),
-            'filing_date_id': record.get('filing_date_id'),
+            'filing_date_id': record.get('application_date_id'),  # map application → filing
             'approval_date_id': record.get('approval_date_id'),
-            'expiration_date_id': record.get('expiration_date_id'),
+            'expiration_date_id': None,  # certificates don't have expiration
             'final_quality_score': record.get('final_quality_score'),
             'data_completeness_score': record.get('data_completeness_score'),
-            'days_to_approval': record.get('days_to_approval'),
-            'status': record.get('status'),
+            'days_to_approval': None,  # not computed for certificates
+            'status': record.get('certificate_status'),  # map certificate_status → status
             'serial_number': record.get('serial_number'),
-            'vendor_code': record.get('vendor_code'),
+            'vendor_code': None,  # certificates don't have vendor_code
             'receipt_method': record.get('receipt_method'),
-            'filing_date': record.get('filing_date'),
+            'filing_date': record.get('application_date'),  # map application → filing
             'approval_date': record.get('approval_date'),
-            'expiration_date': record.get('expiration_date'),
+            'expiration_date': None,
             'partition_date': record.get('partition_date'),
             'fact_creation_timestamp': record.get('fact_creation_timestamp'),
             'source_extraction_timestamp': record.get('source_extraction_timestamp'),
@@ -334,6 +372,13 @@ def _create_cola_application_id(ttb_id: str) -> int:
     return int(hashlib.md5(key_string.encode()).hexdigest()[:8], 16)
 
 
+def _clean_date_value(value):
+    """Convert empty strings to None for date fields."""
+    if value is None or value == '' or value == 'None':
+        return None
+    return value
+
+
 def _calculate_days_to_approval(record: Dict[str, Any]) -> int:
     """Calculate days between filing/application date and approval date."""
     from datetime import datetime
@@ -382,14 +427,121 @@ def _create_date_id(date_val) -> int:
     return None
 
 
+def _merge_ttb_records(cola_record: Dict[str, Any], cert_record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge cola-detail and certificate records, preferring cola-detail values.
+    """
+    if cola_record and cert_record:
+        # Start with cola-detail as base (more complete)
+        merged = cola_record.copy()
+        # Fill missing/None fields from certificate
+        for key, value in cert_record.items():
+            if key not in merged or merged[key] is None or merged[key] == '':
+                merged[key] = value
+        merged['has_certificate'] = True
+        merged['has_cola_detail'] = True
+        return merged
+    elif cola_record:
+        merged = cola_record.copy()
+        merged['has_cola_detail'] = True
+        merged['has_certificate'] = False
+        return merged
+    elif cert_record:
+        merged = cert_record.copy()
+        merged['has_certificate'] = True
+        merged['has_cola_detail'] = False
+        return merged
+    return {}
+
+
+def _infer_source_of_product(origin_code: str, origin_codes_lookup: Dict[str, str]) -> str:
+    """
+    Infer source_of_product (DOMESTIC/IMPORTED) from origin_code.
+    Uses ttb_reference_data for accurate lookup, falls back to keyword matching.
+    """
+    if not origin_code:
+        return None
+
+    origin_upper = origin_code.upper().strip()
+
+    # First, check if origin_code exists in reference data
+    if origin_codes_lookup:
+        description = origin_codes_lookup.get(origin_upper, '').upper()
+        # TTB reference data descriptions indicate country/region
+        # US states/regions are DOMESTIC, foreign countries are IMPORTED
+        if description:
+            # Check for US indicators in description
+            us_indicators = ['UNITED STATES', 'USA', 'U.S.', 'AMERICAN']
+            if any(ind in description for ind in us_indicators):
+                return 'DOMESTIC'
+            # If it's a known foreign country, it's imported
+            return 'IMPORTED'
+
+    # Fallback: keyword-based inference
+    us_origins = {'USA', 'UNITED STATES', 'US', 'AMERICAN', 'DOMESTIC',
+                  'CALIFORNIA', 'KENTUCKY', 'TENNESSEE', 'OREGON', 'WASHINGTON',
+                  'NEW YORK', 'TEXAS', 'FLORIDA', 'VIRGINIA', 'COLORADO'}
+
+    if origin_upper in us_origins or 'USA' in origin_upper or 'AMERICAN' in origin_upper:
+        return 'DOMESTIC'
+
+    # If we have an origin code but it's not US, assume imported
+    return 'IMPORTED'
+
+
+def _infer_type_of_product(class_type_code: str, product_class_lookup: Dict[str, str]) -> str:
+    """
+    Infer type_of_product from class_type_code.
+    Uses ttb_reference_data for accurate lookup, falls back to keyword matching.
+    """
+    if not class_type_code:
+        return None
+
+    class_upper = class_type_code.upper().strip()
+
+    # First, check reference data for official classification
+    if product_class_lookup:
+        description = product_class_lookup.get(class_upper, '').upper()
+        if description:
+            # Check description for product type indicators
+            if any(kw in description for kw in ['WINE', 'CHAMPAGNE', 'VERMOUTH', 'SAKE']):
+                return 'WINE'
+            if any(kw in description for kw in ['SPIRIT', 'WHISKEY', 'VODKA', 'RUM',
+                    'GIN', 'BRANDY', 'TEQUILA', 'LIQUEUR', 'CORDIAL']):
+                return 'DISTILLED SPIRITS'
+            if any(kw in description for kw in ['BEER', 'ALE', 'MALT', 'LAGER']):
+                return 'MALT BEVERAGE'
+
+    # Fallback: keyword matching on the class_type_code itself
+    class_lower = class_type_code.lower()
+
+    if any(kw in class_lower for kw in ['wine', 'champagne', 'port', 'sherry',
+            'vermouth', 'sake', 'mead', 'cider', 'perry', 'sparkling']):
+        return 'WINE'
+
+    if any(kw in class_lower for kw in ['tequila', 'whiskey', 'whisky', 'vodka',
+            'rum', 'gin', 'brandy', 'cognac', 'spirits', 'liqueur', 'cordial',
+            'mezcal', 'bourbon', 'scotch', 'rye', 'agave']):
+        return 'DISTILLED SPIRITS'
+
+    if any(kw in class_lower for kw in ['beer', 'ale', 'lager', 'malt', 'stout',
+            'porter', 'pilsner', 'ipa']):
+        return 'MALT BEVERAGE'
+
+    return None
+
+
 @asset(
     partitions_def=daily_partitions,
     group_name="ttb_supabase_export",
     description="Export complete COLA application data to Supabase with all fields",
-    ins={"ttb_extracted_data": AssetIn()},
+    ins={
+        "ttb_extracted_data": AssetIn(),
+        "ttb_reference_data": AssetIn()
+    },
     io_manager_key="supabase_io_manager"
 )
-def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_extracted_data: Dict[str, Any]) -> Dict[str, Any]:
+def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_extracted_data: Dict[str, Any], ttb_reference_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Export COLA application data to Supabase fact_cola_applications table.
 
@@ -413,11 +565,48 @@ def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_e
         logger.warning("No extracted records found")
         return {"records": []}
 
-    logger.info(f"Exporting {len(extracted_records)} COLA application records")
+    logger.info(f"Processing {len(extracted_records)} extracted records")
 
-    # Transform extracted records for Supabase (all fields as separate columns)
-    transformed_records = []
+    # Extract lookup tables from reference data for inference
+    product_class_types = ttb_reference_data.get('product_class_types', {})
+    origin_codes = ttb_reference_data.get('origin_codes', {})
+
+    # Create lookup dictionaries (code -> description)
+    product_class_lookup = product_class_types.get('by_code', {}) if isinstance(product_class_types, dict) else {}
+    origin_codes_lookup = origin_codes.get('by_code', {}) if isinstance(origin_codes, dict) else {}
+
+    logger.info(f"Loaded {len(product_class_lookup)} product class types and {len(origin_codes_lookup)} origin codes for inference")
+
+    # STEP 1: Group records by TTB ID
+    records_by_ttb_id = {}
     for record in extracted_records:
+        ttb_id = record.get('ttb_id', '')
+        if not ttb_id:
+            continue
+        data_type = record.get('data_type', 'unknown')
+        if ttb_id not in records_by_ttb_id:
+            records_by_ttb_id[ttb_id] = {'cola-detail': None, 'certificate': None}
+        if data_type == 'cola-detail':
+            records_by_ttb_id[ttb_id]['cola-detail'] = record
+        elif data_type == 'certificate':
+            records_by_ttb_id[ttb_id]['certificate'] = record
+        else:
+            # Unknown data_type - use as cola-detail fallback if none exists
+            if records_by_ttb_id[ttb_id]['cola-detail'] is None:
+                records_by_ttb_id[ttb_id]['cola-detail'] = record
+
+    # STEP 2: Merge paired records (prefer cola-detail over certificate)
+    merged_records = []
+    for ttb_id, record_pair in records_by_ttb_id.items():
+        merged = _merge_ttb_records(record_pair['cola-detail'], record_pair['certificate'])
+        if merged:
+            merged_records.append(merged)
+
+    logger.info(f"Merged {len(extracted_records)} records into {len(merged_records)} unique TTB IDs")
+
+    # Transform merged records for Supabase (all fields as separate columns)
+    transformed_records = []
+    for record in merged_records:
         ttb_id = record.get('ttb_id', '')
 
         # Extract ct_code and or_code from ttb_codes if nested
@@ -452,6 +641,18 @@ def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_e
                 type_of_product = 'DISTILLED SPIRITS'
             elif product_type.get('malt_beverage'):
                 type_of_product = 'MALT BEVERAGE'
+
+        # ENHANCED: Infer source_of_product from origin_code using reference data
+        if not source_of_product:
+            origin_code = record.get('origin_code')
+            if origin_code:
+                source_of_product = _infer_source_of_product(origin_code, origin_codes_lookup)
+
+        # ENHANCED: Infer type_of_product from class_type_code using reference data
+        if not type_of_product:
+            class_type_code = record.get('class_type_code')
+            if class_type_code:
+                type_of_product = _infer_type_of_product(class_type_code, product_class_lookup)
 
         transformed_record = {
             # Primary identification
@@ -494,16 +695,22 @@ def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_e
             'qualifications': record.get('qualifications'),
             'additional_information': record.get('additional_information'),
 
-            # Dates
-            'filing_date': record.get('filing_date') or record.get('application_date'),
-            'approval_date': record.get('approval_date'),
-            'application_date': record.get('application_date'),
-            'expiration_date': record.get('expiration_date'),
+            # Dates (clean empty strings to None)
+            'filing_date': _clean_date_value(record.get('filing_date') or record.get('application_date')),
+            'approval_date': _clean_date_value(record.get('approval_date')),
+            'application_date': _clean_date_value(record.get('application_date')),
+            'expiration_date': _clean_date_value(record.get('expiration_date')),
             'days_to_approval': _calculate_days_to_approval(record),
 
             # Signatures (separate columns, not JSONB)
             'applicant_signature': applicant_signature,
-            'applicant_name': record.get('applicant_name') or record.get('applicant_business_name'),
+            # applicant_name: person who signed (Field 18 from certificate)
+            # applicant_business_name: company name (from cola-detail or Field 8)
+            # Filter out "(Required)" which can come from HTML label parsing errors
+            'applicant_name': (
+                record.get('applicant_name') if record.get('applicant_name') and record.get('applicant_name') != '(Required)'
+                else (record.get('applicant_business_name') if record.get('applicant_business_name') and record.get('applicant_business_name') != '(Required)' else None)
+            ),
             'ttb_authorized_signature': ttb_authorized_signature,
 
             # Permit reference
@@ -513,8 +720,8 @@ def supabase_fact_cola_applications(context, config: SupabaseExportConfig, ttb_e
             # Quality metrics
             'final_quality_score': record.get('final_quality_score'),
             'data_completeness_score': record.get('data_completeness_score'),
-            'has_certificate_data': record.get('has_certificate', False) or record.get('data_type') == 'certificate',
-            'has_cola_detail_data': record.get('has_cola_detail', False) or record.get('data_type') == 'cola-detail',
+            'has_certificate_data': record.get('has_certificate', False),
+            'has_cola_detail_data': record.get('has_cola_detail', False),
 
             # Partition and timestamps
             'partition_date': record.get('partition_date') or context.partition_key,

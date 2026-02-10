@@ -19,7 +19,7 @@ from dagster import (
 
 from ..config.ttb_partitions import daily_partitions
 from .processed import ttb_structured_data
-from .dimensional import dim_companies, dim_products, dim_dates
+from .dimensional import dim_companies, dim_products, dim_dates, _infer_product_category, _resolve_business_name
 
 
 class FactConfig(Config):
@@ -91,8 +91,8 @@ def fact_products(
             company_id = _get_company_foreign_key(record, company_lookup)
             product_id = _get_product_foreign_key(record, product_lookup)
 
-            # Create date keys
-            filing_date_id = _create_date_id(record.get('filing_date'))
+            # Create date keys (fall back to cert_* fields when top-level is None)
+            filing_date_id = _create_date_id(record.get('filing_date') or record.get('cert_application_date'))
             approval_date_id = _create_date_id(record.get('approval_date'))
             expiration_date_id = _create_date_id(record.get('expiration_date'))
 
@@ -125,13 +125,13 @@ def fact_products(
                 # Business attributes
                 'class_type_code': record.get('class_type_code', ''),
                 'origin_code': record.get('origin_code', ''),
-                'product_category': record.get('product_category', 'OTHER'),
+                'product_category': record.get('product_category') or _infer_product_category(record.get('class_type_code', '')),
                 'status': record.get('status', ''),
                 'serial_number': record.get('serial_number'),
                 'vendor_code': record.get('vendor_code'),
 
-                # Dates
-                'filing_date': record.get('filing_date'),
+                # Dates (fall back to cert_* fields when top-level is None)
+                'filing_date': record.get('filing_date') or record.get('cert_application_date'),
                 'approval_date': record.get('approval_date'),
                 'expiration_date': record.get('expiration_date'),
 
@@ -183,7 +183,7 @@ def fact_products(
     partitions_def=daily_partitions,
     group_name="ttb_facts",
     description="Certificate fact table with regulatory and compliance metrics",
-    deps=[AssetDep(ttb_structured_data), AssetDep(dim_companies)],
+    deps=[AssetDep(ttb_structured_data), AssetDep(dim_companies), AssetDep(dim_products)],
     metadata={
         "data_type": "fact",
         "schema": "star",
@@ -194,16 +194,18 @@ def fact_certificates(
     context: AssetExecutionContext,
     config: FactConfig,
     ttb_structured_data: Dict[str, Any],
-    dim_companies: Dict[str, Any]
+    dim_companies: Dict[str, Any],
+    dim_products: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
     Create certificate fact table for regulatory compliance analytics.
 
-    Links certificate data to company dimensions for compliance tracking.
+    Links certificate data to company and product dimensions for compliance tracking.
 
     Args:
         ttb_structured_data: Structured TTB data
         dim_companies: Company dimension data
+        dim_products: Product dimension data
 
     Returns:
         Dictionary containing certificate fact table data
@@ -216,14 +218,16 @@ def fact_certificates(
     # Get structured records
     structured_records = ttb_structured_data.get('structured_records', [])
 
-    # Create lookup dictionary for foreign keys
+    # Create lookup dictionaries for foreign keys
     company_lookup = _create_company_lookup(dim_companies.get('records', []))
+    product_lookup = _create_product_lookup(dim_products.get('records', []))
 
     fact_records = []
     stats = {
         'total_records': len(structured_records),
         'fact_records_created': 0,
         'missing_company_keys': 0,
+        'missing_product_keys': 0,
         'approved_certificates': 0,
         'quality_scores': []
     }
@@ -236,6 +240,7 @@ def fact_certificates(
         try:
             # Get foreign keys
             company_id = _get_company_foreign_key(record, company_lookup)
+            product_id = _get_product_foreign_key(record, product_lookup)
 
             # Create date keys
             application_date_id = _create_date_id(record.get('cert_application_date'))
@@ -244,6 +249,8 @@ def fact_certificates(
             # Track missing keys
             if not company_id:
                 stats['missing_company_keys'] += 1
+            if not product_id:
+                stats['missing_product_keys'] += 1
 
             # Check if approved
             cert_status = record.get('cert_status', '').upper()
@@ -259,6 +266,7 @@ def fact_certificates(
 
                 # Foreign keys to dimensions
                 'company_id': company_id,
+                'product_id': product_id,
                 'application_date_id': application_date_id,
                 'approval_date_id': approval_date_id,
 
@@ -302,7 +310,7 @@ def fact_certificates(
 
     logger.info(f"Created {stats['fact_records_created']} certificate fact records")
     logger.info(f"Approval rate: {approval_rate:.2%}")
-    logger.info(f"Missing company keys: {stats['missing_company_keys']}")
+    logger.info(f"Missing foreign keys: {stats['missing_company_keys']} companies, {stats['missing_product_keys']} products")
 
     # Add metadata
     context.add_output_metadata({
@@ -311,6 +319,7 @@ def fact_certificates(
         "approved_certificates": MetadataValue.int(stats['approved_certificates']),
         "approval_rate": MetadataValue.float(approval_rate),
         "missing_company_keys": MetadataValue.int(stats['missing_company_keys']),
+        "missing_product_keys": MetadataValue.int(stats['missing_product_keys']),
         "average_quality_score": MetadataValue.float(avg_quality_score),
         "partition_date": MetadataValue.text(date_str)
     })
@@ -319,7 +328,7 @@ def fact_certificates(
         'fact_name': 'certificates',
         'records': fact_records,
         'primary_key': 'certificate_fact_id',
-        'foreign_keys': ['company_id', 'application_date_id', 'approval_date_id'],
+        'foreign_keys': ['company_id', 'product_id', 'application_date_id', 'approval_date_id'],
         'record_count': len(fact_records),
         'partition_date': date_str,
         'statistics': stats,
@@ -353,7 +362,8 @@ def _create_product_lookup(product_records: List[Dict[str, Any]]) -> Dict[str, i
 
 def _get_company_foreign_key(record: Dict[str, Any], company_lookup: Dict[str, int]) -> Optional[int]:
     """Get company foreign key for a record."""
-    business_name = record.get('applicant_business_name', '').strip().upper()
+    business_name = _resolve_business_name(record)
+    business_name = (business_name or '').strip().upper()
     mailing_address = record.get('applicant_mailing_address', '').strip().upper()
     key = f"{business_name}|{mailing_address}"
     return company_lookup.get(key)

@@ -7,6 +7,7 @@ parsing success rates, validation metrics, and system health for the TTB pipelin
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
+import re
 
 from dagster import (
     asset_check,
@@ -27,57 +28,44 @@ from ..config.ttb_partitions import daily_partitions
 
 
 @asset_check(
-    asset=ttb_raw_data,
-    name="parsing_success_rate",
-    description="Check that TTB HTML parsing success rate is above threshold"
+    asset=ttb_extracted_data,
+    name="extraction_success_rate",
+    description="Check that TTB HTML extraction success rate is above threshold"
 )
-def check_parsing_success_rate(context: AssetCheckExecutionContext, ttb_raw_data) -> AssetCheckResult:
+def check_extraction_success_rate(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
     """
-    Verify that the parsing success rate for TTB HTML files is acceptable.
+    Verify that the extraction success rate for TTB HTML files is acceptable.
 
     Fails if success rate is below 85%, warns if below 95%.
     """
     logger = get_dagster_logger()
 
-    # Check if we have a specific partition context
-    if hasattr(context, 'partition_key') and context.partition_key:
-        logger.info(f"Running parsing success rate check for partition: {context.partition_key}")
-
     try:
-        # Handle case where ttb_raw_data might be a dict or have stats
-        if isinstance(ttb_raw_data, dict):
-            stats = ttb_raw_data.get('processing_stats', {})
-        else:
-            # If it's not a dict, try to get stats attribute or default to empty
-            stats = getattr(ttb_raw_data, 'processing_stats', {})
-        total_files = stats.get('total_files', 0)
-        successful_parses = stats.get('successful_parses', 0)
-        failed_parses = stats.get('failed_parses', 0)
+        stats = ttb_extracted_data.get('processing_stats', {})
+        total_records = stats.get('total_records', 0)
+        successful = stats.get('successful_extractions', 0)
+        failed = stats.get('failed_extractions', 0)
+        partition_date = ttb_extracted_data.get('partition_date', '')
 
-        if total_files == 0:
+        if total_records == 0:
             return AssetCheckResult(
                 passed=False,
                 severity=AssetCheckSeverity.WARN,
-                description="No files found to process",
-                metadata={
-                    "total_files": total_files,
-                    "partition": context.partition_key
-                }
+                description="No records found to process",
+                metadata={"total_records": 0, "partition_date": partition_date}
             )
 
-        success_rate = (successful_parses / total_files) * 100
+        success_rate = (successful / total_records) * 100
 
-        # Define thresholds
-        failure_threshold = 85.0  # Below this is a failure
-        warning_threshold = 95.0  # Below this is a warning
+        failure_threshold = 85.0
+        warning_threshold = 95.0
 
         passed = success_rate >= failure_threshold
         severity = AssetCheckSeverity.ERROR if success_rate < failure_threshold else (
             AssetCheckSeverity.WARN if success_rate < warning_threshold else None
         )
 
-        description = f"Parsing success rate: {success_rate:.1f}% ({successful_parses}/{total_files} files)"
-
+        description = f"Extraction success rate: {success_rate:.1f}% ({successful}/{total_records} records)"
         if not passed:
             description += f" - Below failure threshold of {failure_threshold}%"
         elif severity == AssetCheckSeverity.WARN:
@@ -89,17 +77,17 @@ def check_parsing_success_rate(context: AssetCheckExecutionContext, ttb_raw_data
             description=description,
             metadata={
                 "success_rate_percent": success_rate,
-                "successful_parses": successful_parses,
-                "failed_parses": failed_parses,
-                "total_files": total_files,
+                "successful_extractions": successful,
+                "failed_extractions": failed,
+                "total_records": total_records,
                 "failure_threshold": failure_threshold,
                 "warning_threshold": warning_threshold,
-                "processing_errors": stats.get('processing_errors', [])[:5]  # Show first 5 errors
+                "partition_date": partition_date
             }
         )
 
     except Exception as e:
-        logger.error(f"Error in parsing success rate check: {str(e)}")
+        logger.error(f"Error in extraction success rate check: {str(e)}")
         return AssetCheckResult(
             passed=False,
             severity=AssetCheckSeverity.ERROR,
@@ -109,94 +97,566 @@ def check_parsing_success_rate(context: AssetCheckExecutionContext, ttb_raw_data
 
 
 @asset_check(
-    asset=ttb_raw_data,
+    asset=ttb_extracted_data,
     name="field_extraction_completeness",
     description="Check that key fields are being extracted from TTB data"
 )
-def check_field_extraction_completeness(context: AssetCheckExecutionContext, ttb_raw_data) -> AssetCheckResult:
+def check_field_completeness(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
     """
-    Verify that essential fields are being extracted from TTB HTML files.
+    Verify that essential fields are being extracted from parsed TTB records.
 
-    Checks for presence of key fields like TTB ID, dates, applicant info.
+    Checks per-field completeness rates split by data type (cola-detail vs certificate).
     """
     logger = get_dagster_logger()
 
     try:
-        parsed_records = ttb_raw_data.get('parsed_records', [])
-        partition_info = ttb_raw_data.get('partition_info', {})
-        data_type = partition_info.get('data_type', 'unknown')
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
 
-        if not parsed_records:
+        if not extracted_records:
             return AssetCheckResult(
                 passed=False,
                 severity=AssetCheckSeverity.WARN,
-                description="No parsed records found",
-                metadata={
-                    "record_count": 0,
-                    "data_type": data_type
-                }
+                description="No extracted records found",
+                metadata={"record_count": 0}
             )
 
-        # Define essential fields by data type
-        if data_type == "cola-detail":
-            essential_fields = [
-                'ttb_id', 'serial_number', 'filing_date', 'applicant_business_name',
-                'brand_name', 'product_description', 'net_contents'
-            ]
-        elif data_type == "certificate":
-            essential_fields = [
-                'ttb_id', 'certificate_number', 'effective_date', 'trade_name',
-                'premises_address', 'permit_type'
-            ]
-        else:
-            essential_fields = ['ttb_id']
-
-        # Calculate field completeness
-        field_stats = {}
-        total_records = len(parsed_records)
-
-        for field in essential_fields:
-            non_empty_count = sum(1 for record in parsed_records
-                                if record.get(field) and str(record[field]).strip())
-            completeness_rate = (non_empty_count / total_records) * 100
-            field_stats[field] = {
-                'completeness_rate': completeness_rate,
-                'non_empty_count': non_empty_count,
-                'total_records': total_records
-            }
-
-        # Check if any essential field has low completeness
-        min_completeness_threshold = 70.0  # Minimum acceptable completeness rate
-        failing_fields = [
-            field for field, stats in field_stats.items()
-            if stats['completeness_rate'] < min_completeness_threshold
+        cola_fields = [
+            'ttb_id', 'serial_number', 'brand_name', 'applicant_business_name',
+            'approval_date', 'filing_date', 'class_type_code', 'origin_code'
+        ]
+        cert_fields = [
+            'ttb_id', 'serial_number', 'brand_name', 'applicant_business_name',
+            'approval_date', 'application_date', 'ct_code', 'or_code'
         ]
 
-        overall_completeness = sum(stats['completeness_rate'] for stats in field_stats.values()) / len(field_stats)
+        cola_records = [r for r in extracted_records if r.get('data_type') == 'cola-detail']
+        cert_records = [r for r in extracted_records if r.get('data_type') == 'certificate']
+
+        min_threshold = 70.0
+        failing_fields = []
+        cola_stats = {}
+        cert_stats = {}
+
+        for field in cola_fields:
+            if cola_records:
+                non_empty = sum(1 for r in cola_records if r.get(field) and str(r[field]).strip())
+                rate = (non_empty / len(cola_records)) * 100
+                cola_stats[field] = {"completeness_rate": rate, "non_empty_count": non_empty, "total": len(cola_records)}
+                if rate < min_threshold:
+                    failing_fields.append(f"cola:{field} ({rate:.0f}%)")
+
+        for field in cert_fields:
+            if cert_records:
+                non_empty = sum(1 for r in cert_records if r.get(field) and str(r[field]).strip())
+                rate = (non_empty / len(cert_records)) * 100
+                cert_stats[field] = {"completeness_rate": rate, "non_empty_count": non_empty, "total": len(cert_records)}
+                if rate < min_threshold:
+                    failing_fields.append(f"cert:{field} ({rate:.0f}%)")
+
+        all_rates = [s["completeness_rate"] for s in list(cola_stats.values()) + list(cert_stats.values())]
+        overall = sum(all_rates) / len(all_rates) if all_rates else 0
 
         passed = len(failing_fields) == 0
         severity = AssetCheckSeverity.WARN if failing_fields else None
 
-        description = f"Field extraction completeness: {overall_completeness:.1f}% average"
+        description = f"Field extraction completeness: {overall:.1f}% average across {len(extracted_records)} records"
         if failing_fields:
-            description += f" - Low completeness fields: {', '.join(failing_fields)}"
+            description += f" - Low: {', '.join(failing_fields[:5])}"
 
         return AssetCheckResult(
             passed=passed,
             severity=severity,
             description=description,
             metadata={
-                "overall_completeness_percent": overall_completeness,
-                "field_statistics": field_stats,
+                "overall_completeness_percent": overall,
+                "cola_detail_field_stats": cola_stats,
+                "certificate_field_stats": cert_stats,
                 "failing_fields": failing_fields,
-                "total_records": total_records,
-                "data_type": data_type,
-                "min_threshold": min_completeness_threshold
+                "total_records": len(extracted_records),
+                "cola_detail_count": len(cola_records),
+                "certificate_count": len(cert_records),
+                "min_threshold": min_threshold
             }
         )
 
     except Exception as e:
-        logger.error(f"Error in field extraction completeness check: {str(e)}")
+        logger.error(f"Error in field completeness check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_extracted_data,
+    name="html_artifact_detection",
+    description="Detect HTML parsing artifacts in extracted text fields"
+)
+def check_html_artifact_detection(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
+    """
+    Detect HTML parsing artifacts like (Required), (Optional), or residual HTML tags.
+
+    Known issue: 279/520 records in partition 2024-01-15 had '(Required)' as business name.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
+        partition_date = ttb_extracted_data.get('partition_date', '')
+
+        if not extracted_records:
+            return AssetCheckResult(
+                passed=True,
+                description="No records to check for artifacts",
+                metadata={"total_records": 0, "partition_date": partition_date}
+            )
+
+        artifact_patterns = [
+            '(required)', '(optional)', 'required', 'optional',
+            '&nbsp;', '&amp;', '&#', '<br>', '<br/>', '<td>', '<tr>', '<div>'
+        ]
+        fields_to_scan = ['applicant_business_name', 'brand_name', 'fanciful_name', 'applicant_mailing_address']
+
+        artifacts_by_field = {f: 0 for f in fields_to_scan}
+        affected_records = 0
+        sample_artifacts = []
+
+        for record in extracted_records:
+            record_has_artifact = False
+            for field in fields_to_scan:
+                value = record.get(field)
+                if not value or not isinstance(value, str):
+                    continue
+                value_lower = value.strip().lower()
+                for pattern in artifact_patterns:
+                    if pattern in value_lower:
+                        artifacts_by_field[field] += 1
+                        record_has_artifact = True
+                        if len(sample_artifacts) < 5:
+                            sample_artifacts.append({
+                                "ttb_id": record.get('ttb_id', ''),
+                                "field": field,
+                                "value": value[:100]
+                            })
+                        break  # one artifact per field per record
+            if record_has_artifact:
+                affected_records += 1
+
+        total = len(extracted_records)
+        artifact_rate = (affected_records / total) * 100
+        max_artifact_rate = 10.0
+
+        # Escalate to ERROR if business_name is systemically bad
+        biz_name_rate = (artifacts_by_field['applicant_business_name'] / total) * 100 if total else 0
+
+        passed = artifact_rate <= max_artifact_rate
+        if not passed and biz_name_rate > 50:
+            severity = AssetCheckSeverity.ERROR
+        elif not passed:
+            severity = AssetCheckSeverity.WARN
+        else:
+            severity = None
+
+        description = f"HTML artifact rate: {artifact_rate:.1f}% ({affected_records}/{total} records)"
+        if not passed:
+            description += f" - business_name artifact rate: {biz_name_rate:.0f}%"
+
+        field_rates = {f: {"count": c, "rate_percent": (c / total) * 100 if total else 0} for f, c in artifacts_by_field.items()}
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "artifact_rate_percent": artifact_rate,
+                "affected_records": affected_records,
+                "total_records": total,
+                "artifacts_by_field": field_rates,
+                "sample_artifacts": sample_artifacts,
+                "max_artifact_rate_threshold": max_artifact_rate,
+                "partition_date": partition_date
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in HTML artifact detection check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_extracted_data,
+    name="date_field_quality",
+    description="Check date field completeness and format validity"
+)
+def check_date_field_quality(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
+    """
+    Validate that date fields are present and parseable.
+
+    Checks presence and validity of date fields for both COLA and certificate records.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
+        partition_date = ttb_extracted_data.get('partition_date', '')
+
+        if not extracted_records:
+            return AssetCheckResult(
+                passed=True,
+                description="No records to check date fields",
+                metadata={"total_records": 0, "partition_date": partition_date}
+            )
+
+        date_formats = ['%m/%d/%Y', '%Y-%m-%d', '%m-%d-%Y', '%B %d, %Y', '%b %d, %Y', '%Y/%m/%d']
+
+        def is_valid_date(val):
+            if not val:
+                return False
+            val_str = str(val).strip()
+            if not val_str:
+                return False
+            # Try ISO format first
+            try:
+                datetime.fromisoformat(val_str.replace('Z', '+00:00'))
+                return True
+            except (ValueError, TypeError):
+                pass
+            for fmt in date_formats:
+                try:
+                    datetime.strptime(val_str, fmt)
+                    return True
+                except (ValueError, TypeError):
+                    pass
+            return False
+
+        cola_dates = ['filing_date', 'approval_date', 'expiration_date']
+        cert_dates = ['application_date', 'approval_date', 'expiration_date']
+
+        cola_records = [r for r in extracted_records if r.get('data_type') == 'cola-detail']
+        cert_records = [r for r in extracted_records if r.get('data_type') == 'certificate']
+
+        date_stats = {}
+        issues = []
+
+        # Check COLA date fields
+        for field in cola_dates:
+            if cola_records:
+                present = sum(1 for r in cola_records if r.get(field) and str(r[field]).strip())
+                valid = sum(1 for r in cola_records if is_valid_date(r.get(field)))
+                presence_rate = (present / len(cola_records)) * 100
+                validity_rate = (valid / present) * 100 if present else 100.0
+                invalid_samples = [str(r.get(field))[:30] for r in cola_records
+                                   if r.get(field) and not is_valid_date(r.get(field))][:3]
+                date_stats[f"cola:{field}"] = {
+                    "presence_rate": presence_rate,
+                    "validity_rate": validity_rate,
+                    "present_count": present,
+                    "valid_count": valid,
+                    "total": len(cola_records),
+                    "invalid_samples": invalid_samples
+                }
+                if field == 'approval_date' and presence_rate < 60:
+                    issues.append(f"cola:approval_date presence {presence_rate:.0f}% < 60%")
+                if validity_rate < 90:
+                    issues.append(f"cola:{field} validity {validity_rate:.0f}% < 90%")
+
+        # Check certificate date fields
+        for field in cert_dates:
+            if cert_records:
+                present = sum(1 for r in cert_records if r.get(field) and str(r[field]).strip())
+                valid = sum(1 for r in cert_records if is_valid_date(r.get(field)))
+                presence_rate = (present / len(cert_records)) * 100
+                validity_rate = (valid / present) * 100 if present else 100.0
+                invalid_samples = [str(r.get(field))[:30] for r in cert_records
+                                   if r.get(field) and not is_valid_date(r.get(field))][:3]
+                date_stats[f"cert:{field}"] = {
+                    "presence_rate": presence_rate,
+                    "validity_rate": validity_rate,
+                    "present_count": present,
+                    "valid_count": valid,
+                    "total": len(cert_records),
+                    "invalid_samples": invalid_samples
+                }
+                if field == 'approval_date' and presence_rate < 60:
+                    issues.append(f"cert:approval_date presence {presence_rate:.0f}% < 60%")
+                if validity_rate < 90:
+                    issues.append(f"cert:{field} validity {validity_rate:.0f}% < 90%")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.WARN if issues else None
+
+        description = f"Date quality across {len(extracted_records)} records"
+        if issues:
+            description += f" - Issues: {'; '.join(issues[:3])}"
+        else:
+            description += " - All date fields within thresholds"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "date_field_stats": date_stats,
+                "total_records": len(extracted_records),
+                "issues": issues,
+                "partition_date": partition_date
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in date field quality check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_extracted_data,
+    name="record_count_consistency",
+    description="Check record count consistency between extracted records and processing stats"
+)
+def check_record_count_consistency(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
+    """
+    Verify that the extracted record count is consistent with processing stats.
+
+    Checks internal data integrity: extracted records should match successful count,
+    and successful + failed should equal total.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
+        stats = ttb_extracted_data.get('processing_stats', {})
+        partition_date = ttb_extracted_data.get('partition_date', '')
+
+        actual_count = len(extracted_records)
+        stats_successful = stats.get('successful_extractions', 0)
+        stats_failed = stats.get('failed_extractions', 0)
+        stats_total = stats.get('total_records', 0)
+
+        issues = []
+
+        # Check extracted count matches reported successful
+        if actual_count != stats_successful:
+            issues.append(f"Record count mismatch: {actual_count} extracted vs {stats_successful} reported successful")
+
+        # Check successful + failed = total
+        if stats_successful + stats_failed != stats_total:
+            issues.append(f"Stats inconsistency: {stats_successful} + {stats_failed} != {stats_total}")
+
+        # Check for empty partition
+        if actual_count == 0 and stats_total > 0:
+            issues.append(f"Zero records extracted from {stats_total} input records")
+
+        passed = len(issues) == 0
+        severity = AssetCheckSeverity.ERROR if issues else None
+
+        description = f"Record counts: {actual_count} extracted, {stats_total} total input"
+        if issues:
+            description += f" - {issues[0]}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "extracted_record_count": actual_count,
+                "stats_successful": stats_successful,
+                "stats_failed": stats_failed,
+                "stats_total": stats_total,
+                "counts_consistent": passed,
+                "partition_date": partition_date
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in record count consistency check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_extracted_data,
+    name="data_type_balance",
+    description="Check balance between cola-detail and certificate extraction counts"
+)
+def check_data_type_balance(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
+    """
+    Ensure both cola-detail and certificate records are extracted in reasonable proportions.
+
+    An imbalanced ratio could indicate a parsing failure for one data type.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
+        partition_date = ttb_extracted_data.get('partition_date', '')
+
+        if not extracted_records:
+            return AssetCheckResult(
+                passed=False,
+                severity=AssetCheckSeverity.WARN,
+                description="No records to check data type balance",
+                metadata={"total_records": 0, "partition_date": partition_date}
+            )
+
+        cola_count = sum(1 for r in extracted_records if r.get('data_type') == 'cola-detail')
+        cert_count = sum(1 for r in extracted_records if r.get('data_type') == 'certificate')
+        total = len(extracted_records)
+
+        issues = []
+
+        if cola_count > 0 and cert_count > 0:
+            balance_ratio = min(cola_count, cert_count) / max(cola_count, cert_count)
+            if balance_ratio < 0.5:
+                issues.append(f"Imbalanced: cola={cola_count}, cert={cert_count} (ratio={balance_ratio:.2f})")
+        elif total > 50:
+            balance_ratio = 0.0
+            missing = "certificate" if cert_count == 0 else "cola-detail"
+            issues.append(f"No {missing} records ({total} total) - systematic extraction failure?")
+        else:
+            balance_ratio = 0.0 if (cola_count == 0 or cert_count == 0) else 1.0
+
+        passed = len(issues) == 0
+        severity = (AssetCheckSeverity.ERROR if (balance_ratio == 0 and total > 50)
+                    else AssetCheckSeverity.WARN if issues else None)
+
+        cola_pct = (cola_count / total) * 100 if total else 0
+        cert_pct = (cert_count / total) * 100 if total else 0
+
+        description = f"Data type balance: cola-detail={cola_count} ({cola_pct:.0f}%), certificate={cert_count} ({cert_pct:.0f}%)"
+        if issues:
+            description += f" - {issues[0]}"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "cola_detail_count": cola_count,
+                "certificate_count": cert_count,
+                "total_records": total,
+                "balance_ratio": balance_ratio,
+                "cola_detail_percentage": cola_pct,
+                "certificate_percentage": cert_pct,
+                "issues": issues,
+                "partition_date": partition_date
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in data type balance check: {str(e)}")
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.ERROR,
+            description=f"Check failed due to error: {str(e)}",
+            metadata={"error": str(e)}
+        )
+
+
+@asset_check(
+    asset=ttb_extracted_data,
+    name="extraction_error_analysis",
+    description="Analyze extraction errors to detect systematic parsing failures"
+)
+def check_extraction_error_analysis(context: AssetCheckExecutionContext, ttb_extracted_data) -> AssetCheckResult:
+    """
+    Analyze extraction_errors lists on records to detect systematic parsing failures.
+
+    Groups errors by pattern and alerts on repeated failures that indicate
+    structural issues with the HTML parser.
+    """
+    logger = get_dagster_logger()
+
+    try:
+        extracted_records = ttb_extracted_data.get('extracted_records', [])
+        partition_date = ttb_extracted_data.get('partition_date', '')
+
+        if not extracted_records:
+            return AssetCheckResult(
+                passed=True,
+                description="No records to analyze for extraction errors",
+                metadata={"total_records": 0, "partition_date": partition_date}
+            )
+
+        total = len(extracted_records)
+        records_with_errors = 0
+        error_counts = {}
+        all_errors = []
+
+        for record in extracted_records:
+            errors = record.get('extraction_errors', [])
+            if errors:
+                records_with_errors += 1
+                for err in errors:
+                    err_str = str(err)
+                    # Normalize: take first 80 chars as pattern key
+                    pattern = err_str[:80]
+                    error_counts[pattern] = error_counts.get(pattern, 0) + 1
+                    if len(all_errors) < 10:
+                        all_errors.append(err_str[:200])
+
+        error_rate = (records_with_errors / total) * 100
+
+        # Detect systematic patterns (>30% of records)
+        systematic = []
+        for pattern, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+            rate = (count / total) * 100
+            if rate > 30:
+                systematic.append({"pattern": pattern, "count": count, "rate_percent": rate})
+
+        issues = []
+        if error_rate > 50:
+            issues.append(f"Critical error rate: {error_rate:.0f}%")
+        elif error_rate > 20:
+            issues.append(f"High error rate: {error_rate:.0f}%")
+
+        for s in systematic:
+            issues.append(f"Systematic: '{s['pattern'][:50]}...' in {s['rate_percent']:.0f}% of records")
+
+        passed = error_rate <= 20 and len(systematic) == 0
+        if error_rate > 50:
+            severity = AssetCheckSeverity.ERROR
+        elif issues:
+            severity = AssetCheckSeverity.WARN
+        else:
+            severity = None
+
+        description = f"Extraction errors: {error_rate:.1f}% of records ({records_with_errors}/{total})"
+        if systematic:
+            description += f", {len(systematic)} systematic pattern(s)"
+
+        return AssetCheckResult(
+            passed=passed,
+            severity=severity,
+            description=description,
+            metadata={
+                "error_rate_percent": error_rate,
+                "records_with_errors": records_with_errors,
+                "total_records": total,
+                "error_pattern_counts": dict(sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:10]),
+                "systematic_errors": systematic,
+                "sample_errors": all_errors,
+                "partition_date": partition_date
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in extraction error analysis check: {str(e)}")
         return AssetCheckResult(
             passed=False,
             severity=AssetCheckSeverity.ERROR,

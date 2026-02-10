@@ -8,6 +8,9 @@ import os
 from dagster import Definitions, load_assets_from_modules, load_asset_checks_from_modules, EnvVar, FilesystemIOManager
 from dagster_aws.s3 import S3PickleIOManager
 
+# Import custom IO manager for EC2-extracted data
+from .resources.io_managers import TTBS3IOManager
+
 # Import organized asset modules
 from . import assets
 from . import checks
@@ -48,12 +51,11 @@ def get_resources_for_environment(environment: str) -> dict:
             base_dir="./dagster_storage"  # Local storage directory
         )
     else:
-        # Use S3 for production or when valid AWS credentials exist
+        # Use custom TTBS3IOManager for S3 - handles EC2-extracted data format
         # All pipeline data stored under s3://ciq-dagster/ttb-pre-prod/
-        io_manager = S3PickleIOManager(
-            s3_bucket=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
-            s3_prefix="ttb-pre-prod",  # All assets stored under this prefix
-            s3_resource=get_s3_resource()
+        io_manager = TTBS3IOManager(
+            bucket_name=EnvVar("TTB_S3_BUCKET").get_value("ciq-dagster"),
+            region_name=EnvVar("AWS_REGION").get_value("us-east-1")
         )
 
     base_resources = {

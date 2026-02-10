@@ -5,7 +5,8 @@ Standardized IO managers for the TTB pipeline following Dagster best practices.
 """
 import tempfile
 import pickle
-from typing import Any, Dict
+from typing import Any, Dict, List
+from datetime import datetime
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -112,57 +113,36 @@ class TTBS3IOManager(ConfigurableIOManager):
             "format": "pickle"
         })
 
-    def _load_raw_data_input(self, context, s3_client, s3_prefix: str) -> Dict[str, Any]:
+    def _load_raw_data_input(self, context, s3_client, s3_prefix: str) -> List[Dict[str, Any]]:
         """
-        Load raw data from nested folder structure by receipt method.
+        Load raw data from EC2 extraction format.
 
-        Reconstructs the full data structure from:
-        {s3_prefix}/partition_date={date}/receipt_method=XXX/data.pickle
+        EC2 format: {s3_prefix}/{year}/{month:02d}/{date}
+        Contains flat pickle with all receipt methods combined.
+
+        Returns:
+            List of raw records (all_records from the pickle) for downstream processing.
         """
         partition_key = context.asset_partition_key
-        base_path = f"{s3_prefix}/partition_date={partition_key}"
+        partition_date = datetime.strptime(partition_key, "%Y-%m-%d").date()
 
-        context.log.info(f"Loading raw data from nested structure at s3://{self.bucket_name}/{base_path}/")
+        # EC2 worker format: ttb_raw_data/{year}/{month:02d}/{date}
+        s3_key = f"{s3_prefix}/{partition_date.year}/{partition_date.month:02d}/{partition_key}"
 
-        method_labels = {0: "hand_delivered", 1: "e_filed", 2: "mailed", 3: "overnight"}
-        by_receipt_method = {}
-        all_records = []
-        summary = {}
+        context.log.info(f"Loading raw data from s3://{self.bucket_name}/{s3_key}")
 
-        # Try to load summary first
-        summary_key = f"{base_path}/_summary.json"
         try:
-            summary_response = s3_client.get_object(Bucket=self.bucket_name, Key=summary_key)
-            summary = json.loads(summary_response['Body'].read().decode('utf-8'))
-            context.log.info(f"Loaded summary from {summary_key}")
+            response = s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            content = response['Body'].read()
+            data = pickle.loads(content)
+
+            # Return all_records directly - this is what downstream assets expect
+            all_records = data.get('all_records', [])
+            context.log.info(f"Loaded {len(all_records)} records from {s3_key}")
+            return all_records
         except Exception as e:
-            context.log.warning(f"Could not load summary: {e}")
-
-        # Load each receipt method's data
-        for method in [0, 1, 2, 3]:
-            method_key = f"{base_path}/receipt_method={method:03d}/data.pickle"
-            try:
-                file_response = s3_client.get_object(Bucket=self.bucket_name, Key=method_key)
-                content = file_response['Body'].read()
-                method_data = pickle.loads(content)
-
-                by_receipt_method[method] = method_data
-                records = method_data.get('records', [])
-                all_records.extend(records)
-
-                context.log.info(f"Loaded {len(records)} records for receipt method {method} ({method_labels.get(method, 'unknown')})")
-            except s3_client.exceptions.NoSuchKey:
-                context.log.info(f"No data for receipt method {method}")
-                by_receipt_method[method] = {"records": [], "stats": {}}
-            except Exception as e:
-                context.log.warning(f"Error loading receipt method {method}: {e}")
-                by_receipt_method[method] = {"records": [], "stats": {}, "error": str(e)}
-
-        return {
-            "by_receipt_method": by_receipt_method,
-            "all_records": all_records,
-            "summary": summary
-        }
+            context.log.error(f"Failed to load from {s3_key}: {e}")
+            raise
 
     def _get_s3_key(self, context: OutputContext) -> str:
         """
@@ -181,25 +161,25 @@ class TTBS3IOManager(ConfigurableIOManager):
             s3_prefix = self.raw_data_prefix
         elif asset_name in ['ttb_extracted_data', 'ttb_cleaned_data', 'ttb_structured_data', 'ttb_consolidated_data']:
             s3_prefix = self.processed_data_prefix
-        elif asset_name in ['dim_dates', 'dim_companies', 'dim_locations', 'dim_product_types', 'fact_products', 'fact_certificates', 'ttb_reference_data']:
+        elif asset_name in ['dim_dates', 'dim_companies', 'dim_products', 'fact_products', 'fact_certificates', 'ttb_reference_data']:
             s3_prefix = self.dimensional_data_prefix
         else:
             s3_prefix = self.processed_data_prefix  # Default fallback
 
         format_type = asset_metadata.get("format", "parquet")
 
+        # Check if this is a partitioned context
+        is_partitioned = hasattr(context, 'has_partition_key') and context.has_partition_key
+
         # For raw data, we use special handling with nested folders by receipt method
-        if asset_name == 'ttb_raw_data':
+        if asset_name == 'ttb_raw_data' and is_partitioned:
             # Return base path - actual saving handled in handle_output with nested structure
             return f"{s3_prefix}/partition_date={context.partition_key}"
 
         # Build S3 key for other assets
-        if hasattr(context, 'partition_key') and context.partition_key:
-            if context.has_partition_key:
-                # Handle daily partitioned assets
-                return f"{s3_prefix}/partition_date={context.partition_key}/{asset_name}.{format_type}"
-            else:
-                return f"{s3_prefix}/{asset_name}.{format_type}"
+        if is_partitioned:
+            # Handle daily partitioned assets
+            return f"{s3_prefix}/partition_date={context.partition_key}/{asset_name}.{format_type}"
         else:
             # Non-partitioned assets
             return f"{s3_prefix}/{asset_name}.{format_type}"
@@ -313,19 +293,22 @@ class TTBS3IOManager(ConfigurableIOManager):
         elif asset_name in ['ttb_extracted_data', 'ttb_cleaned_data', 'ttb_structured_data', 'ttb_consolidated_data']:
             s3_prefix = self.processed_data_prefix
             format_type = "pickle"  # Processed data is pickle
-        elif asset_name in ['dim_dates', 'dim_companies', 'dim_locations', 'dim_product_types', 'fact_products', 'fact_certificates', 'ttb_reference_data']:
+        elif asset_name in ['dim_dates', 'dim_companies', 'dim_products', 'fact_products', 'fact_certificates', 'ttb_reference_data']:
             s3_prefix = self.dimensional_data_prefix
             format_type = "pickle"  # Dimensional data is pickle
         else:
             s3_prefix = self.processed_data_prefix  # Default fallback
             format_type = "pickle"
 
+        # Check if this is a partitioned asset
+        is_partitioned = hasattr(context, 'has_asset_partitions') and context.has_asset_partitions
+
         # Special handling for ttb_raw_data - load from nested structure
-        if asset_name == 'ttb_raw_data' and hasattr(context, 'asset_partition_key') and context.asset_partition_key:
+        if asset_name == 'ttb_raw_data' and is_partitioned:
             return self._load_raw_data_input(context, s3_client, s3_prefix)
 
         # Build S3 key for daily partitioned assets only
-        if hasattr(context, 'asset_partition_key') and context.asset_partition_key:
+        if is_partitioned:
             # Daily partition
             s3_key = f"{s3_prefix}/partition_date={context.asset_partition_key}/{asset_name}.{format_type}"
         else:

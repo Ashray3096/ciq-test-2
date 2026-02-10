@@ -246,20 +246,26 @@ class COLADetailParser(TTBDataExtractor):
     def _extract_qualifications(self, soup: BeautifulSoup) -> Optional[str]:
         """Extract the qualifications text block."""
         try:
-            # Find qualifications section
+            # Method 1: Find "TTB has not reviewed" text directly (most reliable)
+            ttb_text = soup.find(string=re.compile('TTB has not reviewed', re.IGNORECASE))
+            if ttb_text:
+                return self._clean_text(ttb_text.strip())
+
+            # Method 2: Find qualifications label and get text from next row
             qual_strong = soup.find('strong', string=re.compile('Qualifications:', re.IGNORECASE))
             if qual_strong:
-                # Get the parent table or container
-                parent = qual_strong.parent
-                while parent and parent.name != 'table':
-                    parent = parent.parent
+                # Navigate up to the <tr> containing the label
+                tr_parent = qual_strong.parent
+                while tr_parent and tr_parent.name != 'tr':
+                    tr_parent = tr_parent.parent
 
-                if parent:
-                    # Extract all text from the qualifications table
-                    qual_text = self._clean_text(parent.get_text())
-                    # Remove the "Qualifications:" header
-                    qual_text = re.sub(r'^Qualifications:\s*', '', qual_text, flags=re.IGNORECASE)
-                    return qual_text if qual_text else None
+                if tr_parent:
+                    # Get the next sibling row which contains the actual qualifications text
+                    next_row = tr_parent.find_next_sibling('tr')
+                    if next_row:
+                        qual_text = self._clean_text(next_row.get_text())
+                        if qual_text:
+                            return qual_text
 
         except Exception as e:
             self.extraction_errors.append(f"Error extracting qualifications: {str(e)}")
@@ -364,8 +370,13 @@ class CertificateParser(TTBDataExtractor):
             company_info = self._extract_certificate_company_info(soup)
             data.update(company_info)
 
-            # Extract applicant name from company info or contact section
-            data['applicant_name'] = company_info.get('applicant_business_name') or self._extract_field_by_number(soup, '8')
+            # Extract applicant name from Field 18 (PRINT NAME OF APPLICANT OR AUTHORIZED AGENT)
+            # or fall back to company info or Field 8
+            data['applicant_name'] = (
+                self._extract_field_by_number(soup, '18') or  # Field 18: Print name of applicant
+                company_info.get('applicant_business_name') or
+                self._extract_field_by_number(soup, '8')
+            )
 
             # Extract signatures as separate columns
             signatures = self._extract_signatures_flat(soup)
